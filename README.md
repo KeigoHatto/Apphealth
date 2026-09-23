@@ -4,7 +4,7 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 突き合わせて可視化・分析する個人用 Web アプリ。設計は [docs/health_app_design.md](docs/health_app_design.md)。
 
 ```
-[iPhone] Health Auto Export ──POST /webhook/health-export──▶ [Render] FastAPI ──▶ [Supabase] Postgres
+[iPhone] Health Auto Export ──POST /webhook/health-export──▶ [Render] FastAPI ──▶ [Neon] Postgres
                                                                  └ / （ダッシュボード・イベント入力・分析）
 ```
 
@@ -14,11 +14,11 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 |---|---|
 | `app/main.py` | API（Webhook受信・ZIP取り込み・イベントCRUD・メトリクス・分析）と静的ファイル配信 |
 | `app/parsing.py` | Health Auto Export JSON → DB行 への変換（純粋関数） |
-| `app/importer.py` | 変換した行を Supabase に upsert。Webhook / ZIP / CLI で共通 |
+| `app/importer.py` | 変換した行を DB に upsert（1回の取り込みは1トランザクション）。Webhook / ZIP / CLI で共通 |
+| `app/db.py` | Postgres 接続プール・スキーマ適用・upsert |
 | `app/analysis.py` | イベント前後比較・ラグ分析・カテゴリ別比較 |
 | `app/static/` | フロントエンド（素の HTML/JS + Chart.js） |
-| `db/schema.sql` | テーブル定義（新規作成用） |
-| `db/migrations/001_dedupe_and_rls.sql` | 旧 schema.sql で作成済みの DB 向けマイグレーション |
+| `db/schema.sql` | テーブル定義（アプリ起動時に自動適用。何度実行しても安全） |
 | `scripts/import_health_data.py` | ZIP を CLI から取り込むスクリプト |
 | `render.yaml` | Render Blueprint |
 
@@ -46,23 +46,31 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 
 ## セットアップ
 
-### 1. Supabase
-SQL Editor で `db/schema.sql` を実行（既に旧版でテーブルを作っている場合は `db/migrations/001_dedupe_and_rls.sql`）。
-RLS を有効にしているため、anon キーではデータにアクセスできません。バックエンドは **service_role キー** を使います。
+### 1. Neon
+1. https://neon.tech でプロジェクトを作成（リージョンは Render と近い場所、例: AWS Singapore / Tokyo）
+2. ダッシュボードの **Connect** から接続文字列（`postgresql://...?sslmode=require`）をコピー
+3. テーブル作成は不要（アプリ起動時に `db/schema.sql` が自動で適用されます）
+
+Neon は使われていない間は計算資源を止めるため、止まった後の最初のリクエストは少し遅くなります（通常1秒未満）。
 
 ### 2. ローカル実行
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-cp .env.example .env   # 値を埋める
+cp .env.example .env   # DATABASE_URL などを埋める
 uvicorn app.main:app --reload
-pytest
 ```
 初回データ投入は画面の「取り込み」タブか、`python -m scripts.import_health_data <ZIP>`。
 
+テスト: 解析ロジックのテストはそのまま、API テストは `TEST_DATABASE_URL` を設定したときだけ実行されます
+（毎回テーブルを TRUNCATE するので、本番とは別の DB か Neon のブランチを指定してください）。
+```bash
+TEST_DATABASE_URL=postgresql://... pytest
+```
+
 ### 3. Render
 1. Render で **New > Blueprint** → このリポジトリを選択（`render.yaml` が読まれる）
-2. `SUPABASE_URL` / `SUPABASE_KEY` / `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` を入力。`WEBHOOK_TOKEN` は自動生成される
+2. `DATABASE_URL` / `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` を入力。`WEBHOOK_TOKEN` は自動生成される
 3. `main` ブランチへの push で自動デプロイ
 
 ### 4. Health Auto Export（Premium）

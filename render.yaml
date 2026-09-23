@@ -12,9 +12,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.7"
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_KEY
+      - key: DATABASE_URL
         sync: false
       - key: WEBHOOK_TOKEN
         generateValue: true

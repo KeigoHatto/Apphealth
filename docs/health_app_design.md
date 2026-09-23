@@ -25,7 +25,9 @@ Apple Watchの健康データ（心拍・睡眠・活動量など）と、日々
 
 - **`heartRateNotifications`**: 心拍異常通知の配列（高心拍/低心拍/不整脈等のアラート、59件確認）。
 
-## 3. データベース設計（Supabase / Postgres）
+## 3. データベース設計（Neon / Postgres）
+
+> 2026-09: Supabase の無料プランのプロジェクト数上限に達したため、Neon（素の Postgres）に変更。
 
 `schema.sql` に完全なDDLあり。テーブル構成:
 
@@ -43,7 +45,7 @@ Apple Watchの健康データ（心拍・睡眠・活動量など）と、日々
 
 `import_health_data.py`（初回検証済み・動作確認要）:
 - ZIPを展開 → JSON読み込み
-- `metrics`を`health_metrics`と`sleep_sessions`に振り分けてSupabaseへupsert
+- `metrics`を`health_metrics`と`sleep_sessions`に振り分けてDBへupsert
 - `workouts`をGPXファイル名と突き合わせてupsert
 - `heartRateNotifications`をinsert
 
@@ -61,19 +63,19 @@ Premium移行後は、Health Auto Export側から直接REST APIエンドポイ�
    - GET  /api/... 系             ← 分析・集計結果を返す
    - 静的ファイル or フロントエンドを同居 or 別ホスティング
         ↓
-[Supabase] Postgres（無料枠）
+[Neon] Postgres（無料枠）
 ```
 
 ### コスト
 - Health Auto Export Premium（年額）: 約1,140円/年（月あたり約95円）
-- Supabase: 無料枠で運用（個人の日次データなら十分な容量）
+- Neon: 無料枠で運用（個人の日次データなら十分な容量）
 - Render: 無料プランでスタート（Webサービスは非アクティブ時スリープするため、1日1回のWebhook受信用途であれば許容範囲。確実な常時稼働が必要になったら有料プラン $7/月 ≒ 約1,140円/月に切り替え検討）
 - **合計: 月あたり約95円〜（Render無料枠利用時）**
 
 ### デプロイ方式
 - コードはGitHubリポジトリで管理（プライベート推奨、ヘルスデータを扱うため）
 - Renderの「New Web Service」でGitHubリポジトリを連携し、Auto-Deployを有効化 → `main`ブランチへのpushで自動反映
-- Supabaseの接続情報（`SUPABASE_URL`, `SUPABASE_KEY`）はRenderの環境変数として設定し、リポジトリには含めない（`.env`は`.gitignore`に追加）
+- DBの接続文字列（`DATABASE_URL`）はRenderの環境変数として設定し、リポジトリには含めない（`.env`は`.gitignore`に追加）
 
 ## 6. 分析の方向性
 - イベント発生日を基準に、前後でHRV・安静時心拍・睡眠スコアがどう変化するか（before/after比較）
@@ -82,8 +84,8 @@ Premium移行後は、Health Auto Export側から直接REST APIエンドポイ�
 
 ## 7. 現状の進捗
 - [x] Health Auto Exportで手動エクスポート済み（JSON + GPX形式、データ構造確認済み）
-- [x] Supabaseのテーブル設計（`schema.sql`）作成済み
-- [x] インポートスクリプト（`import_health_data.py`）作成済み（Supabaseへの実接続・動作確認はこれから）
+- [x] テーブル設計（`schema.sql`）作成済み（Supabase → Neon に移行）
+- [x] インポートスクリプト（`import_health_data.py`）作成済み（DBへの実接続・動作確認はこれから）
 - [ ] Health Auto ExportをPremiumにアップグレード
 - [x] GitHubリポジトリ作成
 - [x] Renderバックエンド構築（Webhook受信 / イベント入力API / 分析API）… `app/`（FastAPI）
@@ -91,5 +93,5 @@ Premium移行後は、Health Auto Export側から直接REST APIエンドポイ�
 - [x] フロントエンド（ダッシュボード、イベント入力フォーム、相関可視化）構築 … `app/static/`
 
 ## 8. 添付ファイル
-- `db/schema.sql`: Supabase用テーブル定義（既存DBは `db/migrations/001_dedupe_and_rls.sql`）
-- `scripts/import_health_data.py`: Health Auto ExportのZIPをパースしてSupabaseに投入するスクリプト（ロジックは `app/parsing.py` / `app/importer.py` に共通化）
+- `db/schema.sql`: テーブル定義（アプリ起動時に自動適用）
+- `scripts/import_health_data.py`: Health Auto ExportのZIPをパースしてDBに投入するスクリプト（ロジックは `app/parsing.py` / `app/importer.py` に共通化）

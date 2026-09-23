@@ -26,33 +26,6 @@ def _to_date(value) -> date:
     return value if isinstance(value, date) else date.fromisoformat(str(value)[:10])
 
 
-def daily_series_from_metrics(rows: Iterable[dict]) -> dict[date, float]:
-    """
-    health_metrics の行を1日1値にする。
-    統計型（心拍など）は avg_value、シンプル型は qty を使う。
-    同じ日に複数 source の行がある場合は平均する。
-    """
-    buckets: dict[date, list[float]] = defaultdict(list)
-    for r in rows:
-        value = r.get("avg_value")
-        if value is None:
-            value = r.get("qty")
-        if value is None:
-            continue
-        buckets[_to_date(r["date"])].append(float(value))
-    return {d: statistics.fmean(v) for d, v in sorted(buckets.items())}
-
-
-def daily_series_from_sleep(rows: Iterable[dict], column: str) -> dict[date, float]:
-    buckets: dict[date, list[float]] = defaultdict(list)
-    for r in rows:
-        value = r.get(column)
-        if value is None:
-            continue
-        buckets[_to_date(r["date"])].append(float(value))
-    return {d: statistics.fmean(v) for d, v in sorted(buckets.items())}
-
-
 def _summary(values: list[float]) -> dict:
     if not values:
         return {"n": 0, "mean": None, "median": None, "sd": None,

@@ -9,16 +9,6 @@ def d(n):
     return date(2026, 1, 1) + timedelta(days=n)
 
 
-def test_daily_series_prefers_avg_and_averages_sources():
-    rows = [
-        {"date": "2026-01-01", "qty": None, "avg_value": 60},
-        {"date": "2026-01-01", "qty": None, "avg_value": 70},
-        {"date": "2026-01-02", "qty": 5, "avg_value": None},
-        {"date": "2026-01-03", "qty": None, "avg_value": None},
-    ]
-    assert analysis.daily_series_from_metrics(rows) == {d(0): 65, d(1): 5}
-
-
 def test_event_impact_detects_drop_next_day():
     # 基本値 50、イベント翌日だけ 40 になる
     events = [10, 30, 50]

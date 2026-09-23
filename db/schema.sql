@@ -1,8 +1,8 @@
 -- ============================================================
--- Health tracking schema for Supabase (Postgres 15+)
+-- Health tracking schema for Postgres 15+（Neon）
 -- Health Auto Export (Apple Watch) 用
 --
--- 既にテーブルを作成済みの場合は db/migrations/001_dedupe_and_rls.sql を実行してください。
+-- アプリ起動時に自動で適用される（何度実行しても安全）。手動で流してもよい。
 -- ============================================================
 
 -- 1) 日次メトリクス（歩数・心拍・HRV・活動系など、qty or Min/Max/Avg形式）
@@ -94,7 +94,7 @@ create index if not exists idx_events_date on events (date);
 create index if not exists idx_events_category on events (category);
 
 -- 6) 取り込まれている指標の一覧（ダッシュボードのセレクタ用）
-create or replace view metric_catalog with (security_invoker = true) as
+create or replace view metric_catalog as
 select metric_name,
        max(units)  as units,
        count(*)    as n_rows,
@@ -102,15 +102,3 @@ select metric_name,
        max(date)   as last_date
 from health_metrics
 group by metric_name;
-
--- ============================================================
--- Row Level Security
--- バックエンドは service_role キーで接続する（service_role は RLS をバイパスする）。
--- RLS を有効にしてポリシーを作らないことで、anon キー経由の読み書きを全て拒否する。
--- （RLSがオフだと、anonキーを知っている人は誰でもヘルスデータを読めてしまう）
--- ============================================================
-alter table health_metrics           enable row level security;
-alter table sleep_sessions           enable row level security;
-alter table workouts                 enable row level security;
-alter table heart_rate_notifications enable row level security;
-alter table events                   enable row level security;

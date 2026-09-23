@@ -1,10 +1,10 @@
 """
 Health Auto Export (Apple Watch) の書き出しZIPを読み込み、
-中身のJSONをパースしてSupabaseにUPSERTするスクリプト（初回データ投入・検証用）。
+中身のJSONをパースしてPostgres（Neon）にUPSERTするスクリプト（初回データ投入・検証用）。
 
 事前準備:
   pip install -r requirements.txt
-  .env に SUPABASE_URL / SUPABASE_KEY を設定（.env.example 参照）
+  .env に DATABASE_URL を設定（.env.example 参照）
 
 使い方（リポジトリのルートで実行）:
   python -m scripts.import_health_data /path/to/HealthAutoExport_YYYYMMDDHHMMSS.zip
@@ -12,13 +12,14 @@ Health Auto Export (Apple Watch) の書き出しZIPを読み込み、
 
 import sys
 
-from app import db, importer
+from app import config, db, importer
 
 
 def main(zip_path: str) -> None:
-    with open(zip_path, "rb") as f:
+    with open(zip_path, "rb") as f, db.connect(config.DATABASE_URL) as conn:
+        db.init_schema(conn)
         try:
-            counts = importer.import_zip(db.get_client(), f)
+            counts = importer.import_zip(conn, f)
         except ValueError as e:
             print(e)
             sys.exit(1)

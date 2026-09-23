@@ -17,19 +17,34 @@ import base64
 import binascii
 import logging
 import secrets
+from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from psycopg import sql
 from pydantic import BaseModel, Field, field_validator
 
 from app import analysis, config, db, importer
 
 logger = logging.getLogger("apphealth")
 
-app = FastAPI(title="Health × Events")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # 起動時にテーブルを作成（既にあれば何もしない）。DBに繋がらなくてもアプリ自体は起動させる
+    if config.DATABASE_URL:
+        try:
+            with db.get_pool().connection() as conn:
+                db.init_schema(conn)
+        except Exception:
+            logger.exception("スキーマの適用に失敗しました")
+    yield
+
+
+app = FastAPI(title="Health × Events", lifespan=lifespan)
 
 STATIC_DIR = Path(__file__).parent / "static"
 PUBLIC_PATHS = ("/webhook/", "/healthz")
@@ -65,7 +80,8 @@ def require_webhook_token(request: Request) -> None:
 
 
 def get_db():
-    return db.get_client()
+    with db.get_pool().connection() as conn:
+        yield conn
 
 
 # ---------------------------------------------------------------- 取り込み
@@ -76,22 +92,22 @@ def healthz():
 
 
 @app.post("/webhook/health-export", dependencies=[Depends(require_webhook_token)])
-async def webhook_health_export(request: Request, client=Depends(get_db)):
+async def webhook_health_export(request: Request, conn=Depends(get_db)):
     try:
         payload = await request.json()
     except ValueError:
         raise HTTPException(400, "JSON を解釈できませんでした")
-    counts = importer.import_payload(client, payload)
+    counts = importer.import_payload(conn, payload)
     logger.info("webhook imported: %s", counts)
     return {"imported": counts}
 
 
 @app.post("/api/import/zip")
-async def import_zip(file: UploadFile = File(...), client=Depends(get_db)):
+async def import_zip(file: UploadFile = File(...), conn=Depends(get_db)):
     if file.size is not None and file.size > MAX_ZIP_BYTES:
         raise HTTPException(413, "ファイルが大きすぎます")
     try:
-        counts = importer.import_zip(client, file.file)
+        counts = importer.import_zip(conn, file.file)
     except (ValueError, KeyError) as e:
         raise HTTPException(400, str(e))
     return {"imported": counts}
@@ -114,86 +130,86 @@ class EventIn(BaseModel):
         return v
 
 
-def _event_row(event: EventIn) -> dict:
-    return {**event.model_dump(), "date": event.date.isoformat()}
+def _where(clauses: list[tuple[str, object]]) -> tuple[sql.Composable, list]:
+    """[("date >= %s", value), ...] から値が None でない条件だけで WHERE 句を作る。"""
+    active = [(c, v) for c, v in clauses if v is not None]
+    if not active:
+        return sql.SQL(""), []
+    return sql.SQL(" where ") + sql.SQL(" and ").join(sql.SQL(c) for c, _ in active), [v for _, v in active]
 
 
 @app.get("/api/events")
 def list_events(start: date | None = None, end: date | None = None,
-                category: str | None = None, client=Depends(get_db)):
-    def q():
-        query = client.table("events").select("*")
-        if start:
-            query = query.gte("date", start.isoformat())
-        if end:
-            query = query.lte("date", end.isoformat())
-        if category:
-            query = query.eq("category", category)
-        return query.order("date", desc=True).order("id", desc=True)
-    return db.fetch_all(q)
+                category: str | None = None, conn=Depends(get_db)):
+    where, params = _where([("date >= %s", start), ("date <= %s", end), ("category = %s", category)])
+    query = sql.SQL("select id, date, category, note, intensity, created_at from events{} "
+                    "order by date desc, id desc").format(where)
+    return conn.execute(query, params).fetchall()
 
 
 @app.post("/api/events", status_code=201)
-def create_event(event: EventIn, client=Depends(get_db)):
-    return client.table("events").insert(_event_row(event)).execute().data[0]
+def create_event(event: EventIn, conn=Depends(get_db)):
+    return conn.execute(
+        "insert into events (date, category, note, intensity) values (%s, %s, %s, %s) "
+        "returning id, date, category, note, intensity, created_at",
+        (event.date, event.category, event.note, event.intensity),
+    ).fetchone()
 
 
 @app.put("/api/events/{event_id}")
-def update_event(event_id: int, event: EventIn, client=Depends(get_db)):
-    data = client.table("events").update(_event_row(event)).eq("id", event_id).execute().data
-    if not data:
+def update_event(event_id: int, event: EventIn, conn=Depends(get_db)):
+    row = conn.execute(
+        "update events set date = %s, category = %s, note = %s, intensity = %s where id = %s "
+        "returning id, date, category, note, intensity, created_at",
+        (event.date, event.category, event.note, event.intensity, event_id),
+    ).fetchone()
+    if not row:
         raise HTTPException(404, "event not found")
-    return data[0]
+    return row
 
 
 @app.delete("/api/events/{event_id}", status_code=204)
-def delete_event(event_id: int, client=Depends(get_db)):
-    client.table("events").delete().eq("id", event_id).execute()
+def delete_event(event_id: int, conn=Depends(get_db)):
+    conn.execute("delete from events where id = %s", (event_id,))
     return Response(status_code=204)
 
 
 @app.get("/api/events/categories")
-def event_categories(client=Depends(get_db)):
-    rows = db.fetch_all(lambda: client.table("events").select("category").order("id"))
-    counts: dict[str, int] = {}
-    for r in rows:
-        counts[r["category"]] = counts.get(r["category"], 0) + 1
-    return [{"category": c, "n": n} for c, n in sorted(counts.items(), key=lambda x: -x[1])]
+def event_categories(conn=Depends(get_db)):
+    return conn.execute(
+        "select category, count(*) as n from events group by category order by n desc, category"
+    ).fetchall()
 
 
 # ---------------------------------------------------------------- メトリクス
 
 @app.get("/api/metrics/catalog")
-def metric_catalog(client=Depends(get_db)):
-    rows = client.table("metric_catalog").select("*").order("metric_name").execute().data or []
+def metric_catalog(conn=Depends(get_db)):
+    rows = conn.execute("select * from metric_catalog order by metric_name").fetchall()
     sleep = [{"metric_name": name, "units": units, "n_rows": None,
               "first_date": None, "last_date": None}
              for name, (_, units) in analysis.SLEEP_METRICS.items()]
     return sleep + rows
 
 
-def load_series(client, metric: str, start: date | None = None,
+def load_series(conn, metric: str, start: date | None = None,
                 end: date | None = None) -> dict[date, float]:
+    """
+    指標を1日1値の {date: 値} にする。
+    統計型（心拍など）は avg_value、シンプル型は qty を使い、同じ日に複数 source があれば平均する。
+    """
     if metric in analysis.SLEEP_METRICS:
         column, _ = analysis.SLEEP_METRICS[metric]
-        table, cols = "sleep_sessions", f"id,date,{column}"
+        where, params = _where([("date >= %s", start), ("date <= %s", end)])
+        query = sql.SQL("select date, avg({col}) as value from sleep_sessions{where} "
+                        "group by date having avg({col}) is not null order by date").format(
+            col=sql.Identifier(column), where=where)
     else:
-        table, cols = "health_metrics", "id,date,qty,avg_value"
-
-    def q():
-        query = client.table(table).select(cols)
-        if table == "health_metrics":
-            query = query.eq("metric_name", metric)
-        if start:
-            query = query.gte("date", start.isoformat())
-        if end:
-            query = query.lte("date", end.isoformat())
-        return query.order("date").order("id")
-
-    rows = db.fetch_all(q)
-    if table == "sleep_sessions":
-        return analysis.daily_series_from_sleep(rows, column)
-    return analysis.daily_series_from_metrics(rows)
+        where, params = _where([("metric_name = %s", metric), ("date >= %s", start), ("date <= %s", end)])
+        query = sql.SQL("select date, avg(coalesce(avg_value, qty)) as value from health_metrics{where} "
+                        "group by date having avg(coalesce(avg_value, qty)) is not null "
+                        "order by date").format(where=where)
+    return {r["date"]: r["value"] for r in conn.execute(query, params)}
 
 
 def _series_json(series: dict[date, float]) -> list[dict]:
@@ -202,43 +218,35 @@ def _series_json(series: dict[date, float]) -> list[dict]:
 
 @app.get("/api/metrics/daily")
 def metric_daily(metric: str, start: date | None = None, end: date | None = None,
-                 client=Depends(get_db)):
-    return {"metric": metric, "series": _series_json(load_series(client, metric, start, end))}
+                 conn=Depends(get_db)):
+    return {"metric": metric, "series": _series_json(load_series(conn, metric, start, end))}
 
 
 @app.get("/api/sleep")
-def sleep_sessions(start: date | None = None, end: date | None = None, client=Depends(get_db)):
-    def q():
-        query = client.table("sleep_sessions").select(
-            "date,source,sleep_start,sleep_end,total_sleep_hr,deep_hr,rem_hr,core_hr,awake_hr")
-        if start:
-            query = query.gte("date", start.isoformat())
-        if end:
-            query = query.lte("date", end.isoformat())
-        return query.order("date").order("id")
-    return db.fetch_all(q)
+def sleep_sessions(start: date | None = None, end: date | None = None, conn=Depends(get_db)):
+    where, params = _where([("date >= %s", start), ("date <= %s", end)])
+    query = sql.SQL("select date, source, sleep_start, sleep_end, total_sleep_hr, deep_hr, rem_hr, "
+                    "core_hr, awake_hr from sleep_sessions{} order by date, id").format(where)
+    return conn.execute(query, params).fetchall()
 
 
 # ---------------------------------------------------------------- 分析
 
-def _load_events(client, category: str | None = None) -> list[dict]:
-    def q():
-        query = client.table("events").select("id,date,category,intensity")
-        if category:
-            query = query.eq("category", category)
-        return query.order("date").order("id")
-    return db.fetch_all(q)
+def _load_events(conn, category: str | None = None) -> list[dict]:
+    where, params = _where([("category = %s", category)])
+    query = sql.SQL("select id, date, category, intensity from events{} order by date, id").format(where)
+    return conn.execute(query, params).fetchall()
 
 
 @app.get("/api/analysis/event-impact")
 def event_impact(metric: str, category: str,
                  window: int = Query(3, ge=1, le=14),
                  min_intensity: int | None = Query(None, ge=1, le=5),
-                 client=Depends(get_db)):
-    events = analysis.filter_events(_load_events(client, category), category, min_intensity)
+                 conn=Depends(get_db)):
+    events = analysis.filter_events(_load_events(conn, category), category, min_intensity)
     dates = analysis.event_dates(events)
     if dates:
-        series = load_series(client, metric, dates[0] - timedelta(days=window + 60),
+        series = load_series(conn, metric, dates[0] - timedelta(days=window + 60),
                              dates[-1] + timedelta(days=window + 60))
     else:
         series = {}
@@ -249,9 +257,9 @@ def event_impact(metric: str, category: str,
 @app.get("/api/analysis/category-comparison")
 def category_comparison(metric: str, lag: int = Query(1, ge=0, le=14),
                         min_intensity: int | None = Query(None, ge=1, le=5),
-                        client=Depends(get_db)):
-    events = analysis.filter_events(_load_events(client), None, min_intensity)
-    series = load_series(client, metric)
+                        conn=Depends(get_db)):
+    events = analysis.filter_events(_load_events(conn), None, min_intensity)
+    series = load_series(conn, metric)
     return {"metric": metric, **analysis.category_comparison(series, events, lag)}
 
 

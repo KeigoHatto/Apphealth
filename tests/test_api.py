@@ -1,25 +1,43 @@
+"""
+API テスト。本物の Postgres が必要:
+  TEST_DATABASE_URL=postgresql://... pytest
+未設定ならスキップする。テーブルは毎テスト TRUNCATE されるので、本番DBを指定しないこと。
+"""
+
 import base64
 import io
 import json
+import os
 import zipfile
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app import config, main
-from tests.fake_supabase import FakeClient
+from app import config, db, main
 from tests.sample_payload import SAMPLE
+
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+pytestmark = pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL が未設定")
+
+TABLES = "health_metrics, sleep_sessions, workouts, heart_rate_notifications, events"
+
+
+def rows(conn, table):
+    return conn.execute(f"select * from {table}").fetchall()
 
 
 @pytest.fixture
 def fake(monkeypatch):
-    client = FakeClient()
-    main.app.dependency_overrides[main.get_db] = lambda: client
-    monkeypatch.setattr(config, "WEBHOOK_TOKEN", "secret-token")
-    monkeypatch.setattr(config, "BASIC_AUTH_USER", "")
-    monkeypatch.setattr(config, "BASIC_AUTH_PASSWORD", "")
-    yield client
-    main.app.dependency_overrides.clear()
+    with db.connect(TEST_DATABASE_URL) as conn:
+        db.init_schema(conn)
+        conn.execute(f"truncate {TABLES} restart identity")
+        main.app.dependency_overrides[main.get_db] = lambda: conn
+        monkeypatch.setattr(config, "DATABASE_URL", "")  # lifespan でプールを作らせない
+        monkeypatch.setattr(config, "WEBHOOK_TOKEN", "secret-token")
+        monkeypatch.setattr(config, "BASIC_AUTH_USER", "")
+        monkeypatch.setattr(config, "BASIC_AUTH_PASSWORD", "")
+        yield conn
+        main.app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -40,9 +58,13 @@ def test_webhook_imports_and_is_idempotent(fake, http):
         assert r.status_code == 200, r.text
     assert r.json()["imported"] == {"health_metrics": 3, "sleep_sessions": 1,
                                     "workouts": 1, "heart_rate_notifications": 1}
-    assert len(fake.store["health_metrics"]) == 3
-    assert len(fake.store["sleep_sessions"]) == 1
-    assert len(fake.store["heart_rate_notifications"]) == 1
+    assert len(rows(fake, "health_metrics")) == 3
+    assert len(rows(fake, "sleep_sessions")) == 1
+    assert len(rows(fake, "heart_rate_notifications")) == 1
+    hr = fake.execute("select * from health_metrics where metric_name = 'heart_rate'").fetchone()
+    assert (hr["min_value"], hr["avg_value"], hr["raw"]["Max"]) == (52, 71.5, 140)
+    sleep = rows(fake, "sleep_sessions")[0]
+    assert sleep["sleep_start"].isoformat() == "2026-08-23T15:18:16+00:00"
 
 
 def test_webhook_rejects_when_token_not_configured(fake, http, monkeypatch):
@@ -58,7 +80,18 @@ def test_zip_import(fake, http):
         zf.writestr("export/Outdoor Run-20260824_0630.gpx", "<gpx/>")
     r = http.post("/api/import/zip", files={"file": ("x.zip", buf.getvalue(), "application/zip")})
     assert r.status_code == 200, r.text
-    assert fake.store["workouts"][0]["gpx_file"] == "Outdoor Run-20260824_0630.gpx"
+    assert rows(fake, "workouts")[0]["gpx_file"] == "Outdoor Run-20260824_0630.gpx"
+
+
+def test_import_rolls_back_on_error(fake, http):
+    bad = json.loads(json.dumps(SAMPLE))
+    bad["data"]["workouts"][0]["duration"] = None
+    bad["data"]["workouts"][0]["start"] = "2026-08-24 06:30:00 +0900"
+    bad["data"]["workouts"][0]["isIndoor"] = "not-a-bool"  # boolean 列に入らない
+    headers = {"Authorization": "Bearer secret-token"}
+    with pytest.raises(Exception):
+        http.post("/webhook/health-export", json=bad, headers=headers)
+    assert rows(fake, "health_metrics") == []
 
 
 def test_zip_without_json(fake, http):
