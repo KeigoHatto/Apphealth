@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Health × Events</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="top">
+    <h1>Health × Events</h1>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="dashboard" aria-selected="true">ダッシュボード</button>
+      <button role="tab" data-tab="events">イベント</button>
+      <button role="tab" data-tab="analysis">分析</button>
+      <button role="tab" data-tab="import">取り込み</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ダッシュボード -->
+    <section id="tab-dashboard" class="tab" role="tabpanel">
+      <div class="filters">
+        <label>指標 <select id="dash-metric" class="metric-select"></select></label>
+        <label>期間
+          <select id="dash-range">
+            <option value="30">30日</option>
+            <option value="90" selected>90日</option>
+            <option value="180">180日</option>
+            <option value="365">1年</option>
+            <option value="0">全期間</option>
+          </select>
+        </label>
+        <label>イベント <select id="dash-category" class="category-select" data-all="すべて"></select></label>
+      </div>
+      <div class="stats" id="dash-stats"></div>
+      <figure class="card">
+        <figcaption id="dash-title">日次推移</figcaption>
+        <div class="chart-box"><canvas id="dash-chart"></canvas></div>
+        <p class="note">● はイベントのあった日（ホバーで内容を表示）</p>
+        <details><summary>表で見る</summary><div id="dash-table" class="table-wrap"></div></details>
+      </figure>
+    </section>
+
+    <!-- イベント -->
+    <section id="tab-events" class="tab" role="tabpanel" hidden>
+      <form id="event-form" class="card form">
+        <h2 id="event-form-title">イベントを記録</h2>
+        <input type="hidden" name="id">
+        <label>日付 <input type="date" name="date" required></label>
+        <label>カテゴリ
+          <input name="category" list="category-list" required placeholder="alcohol / stress / travel …" maxlength="50">
+          <datalist id="category-list"></datalist>
+        </label>
+        <label>強度（任意）
+          <select name="intensity">
+            <option value="">―</option>
+            <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+          </select>
+        </label>
+        <label class="wide">メモ <textarea name="note" rows="2" maxlength="2000"></textarea></label>
+        <div class="actions">
+          <button type="submit" class="primary">保存</button>
+          <button type="button" id="event-cancel" hidden>キャンセル</button>
+        </div>
+        <p id="event-msg" class="msg" role="status"></p>
+      </form>
+      <div class="card">
+        <h2>記録一覧</h2>
+        <div id="event-list" class="table-wrap"></div>
+      </div>
+    </section>
+
+    <!-- 分析 -->
+    <section id="tab-analysis" class="tab" role="tabpanel" hidden>
+      <div class="filters">
+        <label>指標 <select id="an-metric" class="metric-select"></select></label>
+        <label>イベント <select id="an-category" class="category-select"></select></label>
+        <label>前後の日数
+          <select id="an-window"><option>1</option><option>2</option><option selected>3</option><option>5</option><option>7</option></select>
+        </label>
+        <label>強度
+          <select id="an-intensity"><option value="">すべて</option><option value="2">2以上</option><option value="3">3以上</option><option value="4">4以上</option></select>
+        </label>
+      </div>
+
+      <figure class="card">
+        <figcaption id="impact-title">イベント前後の変化</figcaption>
+        <p class="note">各イベントの直前の平均（ベースライン）からの差の平均。0日目がイベント当日。</p>
+        <div class="chart-box"><canvas id="impact-chart"></canvas></div>
+        <h3>ラグ別の比較（イベント日+N日 vs 影響のない日）</h3>
+        <div id="lag-table" class="table-wrap"></div>
+      </figure>
+
+      <figure class="card">
+        <figcaption>カテゴリ別の比較</figcaption>
+        <div class="filters inline">
+          <label>イベントの
+            <select id="cc-lag"><option value="0">当日</option><option value="1" selected>翌日</option><option value="2">翌々日</option></select>
+            の値
+          </label>
+        </div>
+        <p class="note">イベントのない日の平均との差。ラベルの括弧内は件数。</p>
+        <div class="chart-box"><canvas id="cc-chart"></canvas></div>
+        <div id="cc-table" class="table-wrap"></div>
+      </figure>
+      <p class="note">※ 件数が少ないうちは偶然の差が大きく出ます。効果量 d は |d|≥0.2 小, ≥0.5 中, ≥0.8 大 が目安です。</p>
+    </section>
+
+    <!-- 取り込み -->
+    <section id="tab-import" class="tab" role="tabpanel" hidden>
+      <form id="import-form" class="card form">
+        <h2>手動エクスポートZIPの取り込み</h2>
+        <p class="note">Health Auto Export で書き出した ZIP（JSON + GPX）をアップロードします。同じデータを再度取り込んでも重複しません。</p>
+        <input type="file" name="file" accept=".zip" required>
+        <div class="actions"><button type="submit" class="primary">取り込む</button></div>
+        <p id="import-msg" class="msg" role="status"></p>
+      </form>
+      <div class="card">
+        <h2>自動同期（Health Auto Export Premium）</h2>
+        <ol class="note">
+          <li>Health Auto Export → Automations → 新規 → REST API</li>
+          <li>URL: <code id="webhook-url"></code></li>
+          <li>Headers: <code>Authorization: Bearer &lt;WEBHOOK_TOKEN&gt;</code></li>
+          <li>Export Format: JSON / Aggregate Data: ON / Period: Day</li>
+        </ol>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
