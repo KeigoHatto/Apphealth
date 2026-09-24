@@ -63,19 +63,81 @@ function signed(v, digits = 1) {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+function dateParts(iso) {
+  const d = new Date(`${iso}T00:00:00`);
+  return { md: `${d.getMonth() + 1}/${d.getDate()}`, wd: WEEKDAYS[d.getDay()], year: d.getFullYear() };
+}
+function dateBlock(iso) {
+  const p = dateParts(iso);
+  const yearNote = p.year !== new Date().getFullYear() ? `${p.year} ` : "";
+  return `<div class="list-date"><span class="day">${p.md}</span><span class="sub">${yearNote}${p.wd}曜</span></div>`;
+}
+const LIST_PAGE = 30;
 function isoDate(d) {
   const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
   return z.toISOString().slice(0, 10);
 }
 
+// 読み込みが長引いたら状態を出す（Render の無料プランはスリープ復帰に数十秒かかる）
+const net = { pending: 0, timers: [] };
+function setNetStatus(text) {
+  const el = $("#net-status");
+  if (text) {
+    $("#net-status-text").textContent = text;
+    el.hidden = false;
+    requestAnimationFrame(() => el.classList.add("show"));
+  } else {
+    el.classList.remove("show");
+  }
+}
+function netStart() {
+  if (net.pending++ > 0) return;
+  net.timers = [
+    setTimeout(() => setNetStatus("読み込み中…"), 1200),
+    setTimeout(() => setNetStatus("サーバーを起動しています（1分ほどかかることがあります）"), 5000),
+  ];
+}
+function netEnd() {
+  if (--net.pending > 0) return;
+  net.timers.forEach(clearTimeout);
+  setNetStatus(null);
+}
+
 async function api(path, options = {}) {
-  const res = await fetch(path, options);
+  netStart();
+  let res;
+  try {
+    res = await fetch(path, options);
+  } finally {
+    netEnd();
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch (_) { /* ignore */ }
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
   return res.status === 204 ? null : res.json();
+}
+
+// 完了・エラーの通知。action を渡すと「元に戻す」などのボタンが付く
+let toastTimer = null;
+function toast(text, { action, onAction, error = false, duration = 4000 } = {}) {
+  const el = $("#toast");
+  const btn = $("#toast-action");
+  $("#toast-text").textContent = text;
+  el.classList.toggle("error", error);
+  btn.hidden = !action;
+  btn.textContent = action || "";
+  btn.onclick = action ? () => { hideToast(); onAction(); } : null;
+  el.hidden = false;
+  requestAnimationFrame(() => el.classList.add("show"));
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, action ? Math.max(duration, 6000) : duration);
+}
+function hideToast() {
+  clearTimeout(toastTimer);
+  $("#toast").classList.remove("show");
 }
 
 function baseChartOptions() {
@@ -115,16 +177,37 @@ function table(headers, rows) {
 
 // ---------------------------------------------------------------- タブ
 
+const TAB_ORDER = ["dashboard", "events", "workouts", "analysis", "import"];
+let currentTab = null;
+
 function showTab(name) {
-  document.querySelectorAll(".tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
-  document.querySelectorAll(".tab").forEach((s) => { s.hidden = s.id !== `tab-${name}`; });
+  if (!TAB_ORDER.includes(name)) name = "dashboard";
+  const prev = currentTab;
+  currentTab = name;
+  document.querySelectorAll(".tabbar button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
+  document.querySelectorAll(".tab").forEach((s) => {
+    s.hidden = s.id !== `tab-${name}`;
+    s.classList.remove("enter-left", "enter-right");
+  });
+  // 右のタブへ移ったら右から、左へ戻ったら左から入ってくる（同じ道を行き来する）
+  if (prev && prev !== name) {
+    const panel = $(`#tab-${name}`);
+    void panel.offsetWidth;
+    panel.classList.add(TAB_ORDER.indexOf(name) > TAB_ORDER.indexOf(prev) ? "enter-right" : "enter-left");
+    window.scrollTo({ top: 0 });
+  }
   try { localStorage.setItem("tab", name); } catch (_) { /* ignore */ }
   if (name === "dashboard") loadDashboard();
   if (name === "events") loadEvents();
   if (name === "workouts") loadWorkouts();
   if (name === "analysis") loadAnalysis();
 }
-document.querySelectorAll(".tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
+document.querySelectorAll(".tabbar button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
+document.querySelectorAll(".tab").forEach((s) => s.addEventListener("animationend", () => s.classList.remove("enter-left", "enter-right")));
+
+// ヘッダーの境界線は、下にコンテンツが潜り込んでいるときだけ出す
+const topBar = $("#top");
+window.addEventListener("scroll", () => topBar.classList.toggle("scrolled", window.scrollY > 4), { passive: true });
 
 // ---------------------------------------------------------------- セレクタ
 
@@ -154,6 +237,10 @@ async function loadCategories() {
   const events = state.categories.filter((c) => c.kind === "event");
   const workouts = state.categories.filter((c) => c.kind === "workout");
   $("#category-list").innerHTML = events.map((c) => `<option value="${esc(c.category)}">`).join("");
+  // よく使うカテゴリはワンタップで入力できるように
+  $("#category-chips").innerHTML = events.slice(0, 8)
+    .map((c) => `<button type="button" class="chip" data-category="${esc(c.category)}">${esc(c.category)}</button>`).join("");
+  syncFormChips();
   const opt = (c) => `<option value="${esc(c.category)}">${esc(catLabel(c.category))}（${c.n}）</option>`;
   const group = (name, items) => (items.length ? `<optgroup label="${name}">${items.map(opt).join("")}</optgroup>` : "");
   document.querySelectorAll(".category-select").forEach((sel) => {
@@ -206,7 +293,7 @@ async function loadDashboard() {
     ["最小", values.length ? fmt(Math.min(...values)) : "―", ""],
     ["最大", values.length ? fmt(Math.max(...values)) : "―", ""],
     ["イベント・ワークアウト", String(events.length), category ? catLabel(category) : "すべて"],
-  ].map(([l, v, s]) => `<div class="stat"><div class="label">${esc(l)}</div><div class="value">${esc(v)}</div><div class="label">${esc(s)}</div></div>`).join("");
+  ].map(([l, v, s]) => `<div class="stat"><div class="label">${esc(l)}</div><div class="value">${esc(v)}</div><div class="sub">${esc(s)}</div></div>`).join("");
 
   // イベントの日はラインの値の位置に点を打つ（値がない日は描かない）
   const byDate = Object.fromEntries(data.series.map((p) => [p.date, p.value]));
@@ -256,6 +343,7 @@ async function loadDashboard() {
 // ---------------------------------------------------------------- イベント
 
 const form = $("#event-form");
+const eventsView = { rows: [], limit: LIST_PAGE };
 
 function resetEventForm() {
   form.reset();
@@ -263,42 +351,154 @@ function resetEventForm() {
   form.date.value = isoDate(new Date());
   $("#event-form-title").textContent = "イベントを記録";
   $("#event-cancel").hidden = true;
+  setCategoryError(false);
+  $("#event-msg").textContent = "";
+  syncFormChips();
+}
+
+function setCategoryError(on) {
+  $("#category-error").hidden = !on;
+  form.category.setAttribute("aria-invalid", String(on));
+}
+
+// チップの選択状態を入力値に合わせる
+function syncFormChips() {
+  const today = isoDate(new Date());
+  document.querySelectorAll("[data-date-offset]").forEach((c) => {
+    const d = new Date();
+    d.setDate(d.getDate() + Number(c.dataset.dateOffset));
+    c.setAttribute("aria-pressed", String(form.date.value === isoDate(d)));
+  });
+  const cat = form.category.value.trim().toLowerCase();
+  document.querySelectorAll("[data-category]").forEach((c) => c.setAttribute("aria-pressed", String(c.dataset.category === cat)));
+  return today;
+}
+
+document.querySelectorAll("[data-date-offset]").forEach((c) => c.addEventListener("click", () => {
+  const d = new Date();
+  d.setDate(d.getDate() + Number(c.dataset.dateOffset));
+  form.date.value = isoDate(d);
+  syncFormChips();
+}));
+$("#category-chips").addEventListener("click", (ev) => {
+  const chip = ev.target.closest("[data-category]");
+  if (!chip) return;
+  form.category.value = chip.dataset.category;
+  setCategoryError(false);
+  syncFormChips();
+});
+form.date.addEventListener("input", syncFormChips);
+form.category.addEventListener("input", () => { setCategoryError(false); syncFormChips(); });
+
+function intensityDots(n) {
+  if (!n) return "";
+  return `<span class="intensity" aria-label="強度${n}">${[1, 2, 3, 4, 5].map((i) => `<i class="${i <= n ? "on" : ""}"></i>`).join("")}</span>`;
+}
+
+function renderEvents() {
+  const { rows, limit } = eventsView;
+  if (!rows.length) {
+    $("#event-list").innerHTML = '<p class="empty">まだ記録がありません。上のフォームから追加できます。</p>';
+    return;
+  }
+  const trash = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>';
+  $("#event-list").innerHTML = `<ul class="list">${rows.slice(0, limit).map((e) => `
+    <li class="list-row tappable" data-id="${e.id}" tabindex="0" aria-label="${esc(e.date)} ${esc(e.category)} を編集">
+      ${dateBlock(e.date)}
+      <div class="list-main">
+        <div class="list-title">${esc(e.category)}</div>
+        ${e.note ? `<div class="list-sub">${esc(e.note)}</div>` : ""}
+      </div>
+      <div class="list-trailing">
+        ${intensityDots(e.intensity)}
+        <button type="button" class="icon-button danger" data-delete="${e.id}" aria-label="削除">${trash}</button>
+      </div>
+    </li>`).join("")}</ul>` +
+    (rows.length > limit ? `<button type="button" class="more" data-more>さらに表示（残り${rows.length - limit}件）</button>` : "");
 }
 
 async function loadEvents() {
-  let events;
   try {
-    events = await api("/api/events");
+    eventsView.rows = await api("/api/events");
   } catch (e) {
     $("#event-list").innerHTML = `<p class="msg error">${esc(e.message)}</p>`;
     return;
   }
-  $("#event-list").innerHTML = table(
-    [{ label: "日付" }, { label: "カテゴリ" }, { label: "強度", num: true }, { label: "メモ", wrap: true }, { label: "" }],
-    events.map((e) => [
-      esc(e.date), esc(e.category), e.intensity ?? "―", esc(e.note || ""),
-      `<button class="link" data-edit='${esc(JSON.stringify(e))}'>編集</button>` +
-      `<button class="link danger" data-delete="${e.id}">削除</button>`,
-    ]),
-  );
+  renderEvents();
 }
 
-$("#event-list").addEventListener("click", async (ev) => {
-  const edit = ev.target.closest("[data-edit]");
+function editEvent(e) {
+  form.id.value = e.id;
+  form.date.value = e.date;
+  form.category.value = e.category;
+  form.intensity.value = e.intensity ?? "";
+  form.note.value = e.note || "";
+  $("#event-form-title").textContent = "イベントを編集";
+  $("#event-cancel").hidden = false;
+  syncFormChips();
+  form.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+}
+
+async function saveEvent(body, id = null) {
+  return api(id ? `/api/events/${id}` : "/api/events", {
+    method: id ? "PUT" : "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function refreshAfterEventChange() {
+  await Promise.all([loadEvents(), loadCategories()]);
+}
+
+// 削除は確認ダイアログを出さず、すぐ消して「元に戻す」を出す
+async function deleteEvent(id) {
+  const e = eventsView.rows.find((r) => String(r.id) === String(id));
+  if (!e) return;
+  eventsView.rows = eventsView.rows.filter((r) => r !== e);
+  renderEvents();
+  try {
+    await api(`/api/events/${id}`, { method: "DELETE" });
+  } catch (err) {
+    toast(`削除できませんでした: ${err.message}`, { error: true });
+    await loadEvents();
+    return;
+  }
+  if (String(form.id.value) === String(id)) resetEventForm();
+  toast(`「${e.category}」を削除しました`, {
+    action: "元に戻す",
+    onAction: async () => {
+      try {
+        await saveEvent({ date: e.date, category: e.category, intensity: e.intensity, note: e.note });
+        toast("元に戻しました");
+      } catch (err) {
+        toast(`元に戻せませんでした: ${err.message}`, { error: true });
+      }
+      await refreshAfterEventChange();
+    },
+  });
+  loadCategories();
+}
+
+$("#event-list").addEventListener("click", (ev) => {
+  if (ev.target.closest("[data-more]")) {
+    eventsView.limit += LIST_PAGE;
+    renderEvents();
+    return;
+  }
   const del = ev.target.closest("[data-delete]");
-  if (edit) {
-    const e = JSON.parse(edit.dataset.edit);
-    form.id.value = e.id;
-    form.date.value = e.date;
-    form.category.value = e.category;
-    form.intensity.value = e.intensity ?? "";
-    form.note.value = e.note || "";
-    $("#event-form-title").textContent = "イベントを編集";
-    $("#event-cancel").hidden = false;
-    form.scrollIntoView({ behavior: "smooth" });
-  } else if (del && confirm("このイベントを削除しますか？")) {
-    await api(`/api/events/${del.dataset.delete}`, { method: "DELETE" });
-    await Promise.all([loadEvents(), loadCategories()]);
+  if (del) {
+    deleteEvent(del.dataset.delete);
+    return;
+  }
+  const row = ev.target.closest(".list-row");
+  if (row) editEvent(eventsView.rows.find((r) => String(r.id) === row.dataset.id));
+});
+$("#event-list").addEventListener("keydown", (ev) => {
+  const row = ev.target.closest(".list-row");
+  if (row && (ev.key === "Enter" || ev.key === " ") && ev.target === row) {
+    ev.preventDefault();
+    editEvent(eventsView.rows.find((r) => String(r.id) === row.dataset.id));
   }
 });
 
@@ -306,27 +506,32 @@ $("#event-cancel").addEventListener("click", resetEventForm);
 
 form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
+  const category = form.category.value.trim();
+  if (!category) {
+    setCategoryError(true);
+    form.category.focus();
+    return;
+  }
   const body = {
-    date: form.date.value,
-    category: form.category.value,
+    date: form.date.value || isoDate(new Date()),
+    category,
     intensity: form.intensity.value ? Number(form.intensity.value) : null,
-    note: form.note.value || null,
+    note: form.note.value.trim() || null,
   };
   const id = form.id.value;
-  const msg = $("#event-msg");
+  const button = form.querySelector("button[type=submit]");
+  button.disabled = true;
   try {
-    await api(id ? `/api/events/${id}` : "/api/events", {
-      method: id ? "PUT" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    msg.className = "msg";
-    msg.textContent = `${body.date} の「${body.category.trim().toLowerCase()}」を保存しました`;
+    await saveEvent(body, id || null);
+    const d = dateParts(body.date);
+    toast(`${d.md}（${d.wd}）の「${category.toLowerCase()}」を${id ? "更新" : "記録"}しました`);
     resetEventForm();
-    await Promise.all([loadEvents(), loadCategories()]);
+    await refreshAfterEventChange();
   } catch (e) {
-    msg.className = "msg error";
-    msg.textContent = `保存できませんでした: ${e.message}`;
+    $("#event-msg").className = "msg error";
+    $("#event-msg").textContent = `保存できませんでした: ${e.message}`;
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -397,20 +602,42 @@ async function loadWorkouts() {
     options: opts,
   });
 
-  $("#wo-list").innerHTML = table(
-    [{ label: "日付" }, { label: "開始" }, { label: "種類" }, { label: "時間", num: true }, { label: "距離", num: true },
-      { label: "消費エネルギー", num: true }, { label: "屋内/屋外" }],
-    rows.map((r) => [
-      esc(r.date),
-      esc(r.start_local),
-      esc(workoutLabel(r.name)),
-      fmtMinutes(r.duration_min),
-      r.distance_qty === null ? "―" : `${fmt(r.distance_qty, 2)} ${esc(r.distance_units || "")}`,
-      r.active_energy_qty === null ? "―" : `${fmt(r.active_energy_qty, 0)} ${esc(r.active_energy_units || "")}`,
-      r.is_indoor === null ? "―" : r.is_indoor ? "屋内" : "屋外",
-    ]),
-  );
+  workoutsView.rows = rows;
+  workoutsView.limit = LIST_PAGE;
+  renderWorkoutList();
 }
+
+const workoutsView = { rows: [], limit: LIST_PAGE };
+
+function renderWorkoutList() {
+  const { rows, limit } = workoutsView;
+  if (!rows.length) {
+    $("#wo-list").innerHTML = '<p class="empty">この期間のワークアウトはありません。</p>';
+    return;
+  }
+  $("#wo-list").innerHTML = `<ul class="list">${rows.slice(0, limit).map((r) => {
+    const sub = [r.start_local, r.is_indoor === null ? null : r.is_indoor ? "屋内" : "屋外",
+      r.active_energy_qty === null ? null : `${fmt(r.active_energy_qty, 0)} ${r.active_energy_units || ""}`]
+      .filter(Boolean).join(" · ");
+    return `
+    <li class="list-row">
+      ${dateBlock(r.date)}
+      <div class="list-main">
+        <div class="list-title">${esc(workoutLabel(r.name))}</div>
+        <div class="list-sub">${esc(sub)}</div>
+      </div>
+      <div class="list-metric">${esc(fmtMinutes(r.duration_min))}
+        ${r.distance_qty === null ? "" : `<span class="sub">${esc(fmt(r.distance_qty, 2))} ${esc(r.distance_units || "")}</span>`}
+      </div>
+    </li>`;
+  }).join("")}</ul>` +
+    (rows.length > limit ? `<button type="button" class="more" data-more>さらに表示（残り${rows.length - limit}件）</button>` : "");
+}
+$("#wo-list").addEventListener("click", (ev) => {
+  if (!ev.target.closest("[data-more]")) return;
+  workoutsView.limit += LIST_PAGE;
+  renderWorkoutList();
+});
 ["#wo-range", "#wo-type"].forEach((s) => $(s).addEventListener("change", loadWorkouts));
 
 // ---------------------------------------------------------------- 分析
@@ -596,6 +823,7 @@ $("#import-form").addEventListener("submit", async (ev) => {
   try {
     const r = await api("/api/import/zip", { method: "POST", body: fd });
     msg.textContent = "取り込み完了: " + Object.entries(r.imported).map(([k, v]) => `${k} ${v}件`).join(", ");
+    toast("取り込みが完了しました");
     await Promise.all([loadCatalog(), loadCategories()]);
   } catch (e) {
     msg.className = "msg error";
