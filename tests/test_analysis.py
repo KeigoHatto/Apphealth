@@ -86,7 +86,68 @@ def test_workout_dose_without_workouts():
     assert r["n"] == 0 and r["r"] is None
 
 
-def test_intensity_filter_skips_workouts():
-    events = [{"category": "workout:Outdoor Run", "intensity": None},
+def test_intensity_filter_skips_workouts_without_intensity():
+    # ラン以外のワークアウトは強度を持たないので絞り込まない。ランは強度スコアで絞り込む
+    events = [{"category": "workout:Yoga", "intensity": None},
+              {"category": "workout:Outdoor Run", "intensity": 8},
+              {"category": "workout:Indoor Run", "intensity": 2},
               {"category": "alcohol", "intensity": 1}]
-    assert [e["category"] for e in analysis.filter_events(events, None, 3)] == ["workout:Outdoor Run"]
+    assert [e["category"] for e in analysis.filter_events(events, None, 3)] == [
+        "workout:Yoga", "workout:Outdoor Run"]
+
+
+def test_run_stats_units():
+    s = analysis.run_stats({"distance_qty": 5, "distance_units": "km", "duration_min": 30})
+    assert s["speed_kmh"] == 10 and s["pace_min_km"] == 6 and s["load"] == 50
+    s = analysis.run_stats({"distance_qty": 1, "distance_units": "mi", "duration_min": None,
+                            "avg_speed": 6, "speed_units": "mi/hr"})
+    assert s["distance_km"] == pytest.approx(1.609344)
+    assert s["speed_kmh"] == pytest.approx(9.656064)
+    assert analysis.run_stats({"distance_qty": 5, "distance_units": None})["distance_km"] is None
+    assert analysis.is_run("Outdoor Run") and analysis.is_run("Running") and not analysis.is_run("Yoga")
+
+
+def test_run_day_measures_combines_runs():
+    runs = [
+        {"date": d(0), "distance_km": 5.0, "duration_min": 30, "speed_kmh": 10.0, "load": 50.0},
+        {"date": d(0), "distance_km": 3.0, "duration_min": 10, "speed_kmh": 18.0, "load": 54.0},
+        {"date": d(1), "distance_km": None, "duration_min": 20, "speed_kmh": None, "load": None},
+    ]
+    assert analysis.run_day_measures(runs, "distance") == {d(0): 8.0, d(1): None}
+    assert analysis.run_day_measures(runs, "speed") == {d(0): 12.0, d(1): None}
+    assert analysis.run_day_measures(runs, "load") == {d(0): 104.0, d(1): None}
+    assert analysis.run_day_measures(runs, "duration") == {d(0): 40, d(1): 20}
+
+
+def test_intensity_scores():
+    scores = analysis.intensity_scores({i: float(i) for i in range(1, 11)} | {"x": None})
+    assert [scores[i] for i in range(1, 11)] == list(range(1, 11))
+    assert scores["x"] is None
+    assert analysis.intensity_scores({"a": None}) == {"a": None}
+
+
+def test_run_intensity_bins():
+    # 長く走った翌日ほど値が低い。ランした日は 3日おき、距離は 3 / 6 / 12 km の繰り返し
+    series = {d(i): 50.0 for i in range(0, 40)}
+    dose = {}
+    for n, i in enumerate(range(0, 36, 3)):
+        km = [3.0, 6.0, 12.0][n % 3]
+        dose[d(i)] = km
+        series[d(i + 1)] = 50.0 - km
+    dose[d(37)] = None  # 距離が分からない日は、なしにも数えない
+    r = analysis.run_intensity(series, dose, lag=1)
+    bins = {b["label"]: b for b in r["bins"]}
+    assert bins["なし"]["mean"] == 50
+    assert bins["低"]["n"] == 4 and bins["低"]["diff"] == -3
+    assert bins["中"]["mean"] == 44
+    assert bins["高"]["diff"] == -12 and 6 <= bins["高"]["lo"] < 12
+    assert r["n_runs"] == 12
+    assert r["r"] == pytest.approx(-1.0)
+    assert d(37).isoformat() not in {p["date"] for p in r["points"]}
+
+
+def test_run_intensity_few_runs():
+    r = analysis.run_intensity({d(1): 40.0, d(2): 50.0}, {d(0): 5.0}, lag=1)
+    assert [b["label"] for b in r["bins"]] == ["なし", "ランあり"]
+    assert r["bins"][1]["diff"] == -10
+    assert analysis.run_intensity({d(0): 1.0}, {}, lag=1)["n"] == 0

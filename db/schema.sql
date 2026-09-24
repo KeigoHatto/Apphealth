@@ -87,11 +87,38 @@ create table if not exists events (
   date          date not null,
   category      text not null,    -- 例: 'alcohol', 'stress', 'travel', 'poor_sleep_env' 等、自由に運用
   note          text,
-  intensity     smallint check (intensity between 1 and 5),  -- 自己申告の強度スコア(任意)
+  intensity     smallint check (intensity between 1 and 10),  -- 自己申告の強度スコア 1〜10(任意)
   created_at    timestamptz not null default now()
 );
 create index if not exists idx_events_date on events (date);
 create index if not exists idx_events_category on events (category);
+
+-- 一度だけ流すデータ移行の記録
+create table if not exists schema_migrations (
+  name        text primary key,
+  applied_at  timestamptz not null default now()
+);
+
+-- 強度を 1〜5 から 1〜10 に変更（既存の値は2倍にして目盛りを合わせる）
+do $$
+begin
+  if not exists (select 1 from schema_migrations where name = 'events_intensity_10') then
+    alter table events drop constraint if exists events_intensity_check;
+    update events set intensity = intensity * 2 where intensity is not null;
+    alter table events add constraint events_intensity_check check (intensity between 1 and 10);
+    insert into schema_migrations (name) values ('events_intensity_10');
+  end if;
+end $$;
+
+-- 5b) イベントのテンプレート（よく使う「カテゴリ + 強度 + メモ」を使い回す）
+create table if not exists event_templates (
+  id          bigserial primary key,
+  category    text not null,
+  intensity   smallint check (intensity between 1 and 10),
+  note        text,
+  created_at  timestamptz not null default now(),
+  constraint event_templates_key unique nulls not distinct (category, intensity, note)
+);
 
 -- 6) 取り込まれている指標の一覧（ダッシュボードのセレクタ用）
 create or replace view metric_catalog as

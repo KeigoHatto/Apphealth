@@ -28,9 +28,13 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 |---|---|---|
 | POST | `/webhook/health-export` | Health Auto Export からの自動送信（`Authorization: Bearer <WEBHOOK_TOKEN>`） |
 | POST | `/api/import/zip` | 手動エクスポート ZIP のアップロード |
-| GET/POST | `/api/events` | イベント一覧 / 作成（`date`, `category`, `note`, `intensity`） |
+| GET/POST | `/api/events` | イベント一覧 / 作成（`date`, `category`, `note`, `intensity` 1〜10） |
+| POST | `/api/events/bulk` | 一括登録（`{"events": [...], "skip_duplicates": true}`。同じ日・同じカテゴリは既定でスキップ） |
+| POST | `/api/events/bulk-delete` | 一括削除（`{"ids": [...]}`。一括登録の取り消し用） |
+| GET/POST | `/api/event-templates` | テンプレート（カテゴリ + 強度 + メモ）一覧 / 作成（同じ内容なら既存を返す） |
+| DELETE | `/api/event-templates/{id}` | テンプレート削除 |
 | PUT/DELETE | `/api/events/{id}` | イベント更新 / 削除 |
-| GET | `/api/events/categories` | カテゴリと件数 |
+| GET | `/api/events/categories` | カテゴリと件数・最終記録日・前回の強度 |
 | GET | `/api/metrics/catalog` | 取り込み済み指標の一覧 |
 | GET | `/api/metrics/daily?metric=&start=&end=` | 1日1値の系列（`sleep_total` 等の睡眠指標も可） |
 | GET | `/api/workouts?start=&end=&name=` | ワークアウト一覧（`date` と `start_local` は `APP_TIMEZONE` 基準） |
@@ -40,6 +44,9 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 | GET | `/api/analysis/event-impact?metric=&category=&window=3` | イベント（またはワークアウト）前後の変化 + ラグ別比較 |
 | GET | `/api/analysis/category-comparison?metric=&lag=1&kind=event` | カテゴリ別の比較（`kind=workout` でワークアウトの種類別） |
 | GET | `/api/analysis/workout-dose?metric=&lag=1&name=` | その日の運動時間と N 日後の指標の関係（区分別の平均・相関係数） |
+| GET | `/api/analysis/run-intensity?metric=&measure=load&lag=1&name=` | ランの強度（`load`=距離×速度 / `distance` / `speed` / `duration`）で日を なし・低・中・高 に分けた比較 |
+
+`event-impact` / `category-comparison` / `occurrences` / `workouts` は `run_measure`（既定 `load`）を受け取り、ランに強度スコアを付けます。
 
 `/webhook/*` と `/healthz` 以外は `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` の Basic 認証で保護されます。
 
@@ -48,7 +55,12 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 - **ラグ別比較**: 「イベント日 + N 日」の値と、どのイベントの 0〜window 日後にも当たらない日の値を比較（差と効果量 Cohen's d）。
 - **カテゴリ別比較**: 各カテゴリの「イベント日 + lag 日」の値と、イベントのない日の値を比較。
 - **ワークアウト**: 各ワークアウトを `workout:<種類>` というカテゴリの出来事として扱うので、上の分析がそのまま使える。
-  強度の絞り込みは手入力イベントにだけ適用。ワークアウト時間は開始〜終了時刻から計算する。
+  ワークアウト時間は開始〜終了時刻から計算する。
+- **強度（1〜10）**: 手入力イベントは入力値。ランは `run_measure` で選んだ基準（距離×速度・距離・速度・時間）で
+  全ランを並べた順位を 1〜10 にした値（上位10%が10）。強度の絞り込みはこの2つに適用し、ラン以外のワークアウトには適用しない。
+  1〜5 だった頃の記録は、初回起動時に一度だけ2倍にして 1〜10 に揃える。
+- **ランの強度と指標**: 速度は 距離÷時間（取れなければ記録された平均速度）、単位は km・km/h に揃える。
+  ランした日を強度の三分位で 低・中・高 に分け、ランしなかった日と N 日後の指標を比較。相関係数はランした日だけで計算。
 - **運動時間と指標**: その日の運動時間の合計（なし / 1〜30分 / 31〜60分 / 61分以上）で日を分け、N 日後の指標の平均を比較。相関係数も表示。
   ワークアウト記録の最初の日より前は対象外。
 - 1日1値への集約: 心拍などの統計型は `Avg`、それ以外は `qty`。同じ日に複数 source があれば平均。

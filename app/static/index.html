@@ -69,48 +69,123 @@
     <section id="tab-events" class="tab" role="tabpanel" hidden>
       <h1 class="page-title">イベント</h1>
       <form id="event-form" class="card form" novalidate>
-        <h2 id="event-form-title">イベントを記録</h2>
+        <div class="form-head">
+          <h2 id="event-form-title">イベントを記録</h2>
+          <div class="segmented compact" role="radiogroup" aria-label="入力方法" id="event-mode">
+            <label><input type="radio" name="mode" value="single" checked><span>1日</span></label>
+            <label><input type="radio" name="mode" value="multi"><span>複数日</span></label>
+            <label><input type="radio" name="mode" value="paste"><span>貼り付け</span></label>
+          </div>
+        </div>
         <input type="hidden" name="id">
 
-        <div class="field">
+        <div class="field" data-modes="single multi">
+          <div class="field-label-row">
+            <span class="field-label">よく使う</span>
+            <button type="button" class="link" id="template-edit" hidden>編集</button>
+          </div>
+          <div class="chips" id="template-chips" aria-label="テンプレートと最近のカテゴリ"></div>
+          <p class="note" id="template-hint" hidden>「テンプレートに保存」にチェックして記録すると、カテゴリ・強度・メモを1タップで入力できます。</p>
+        </div>
+
+        <div class="field" data-modes="single">
           <span class="field-label" id="date-label">日付</span>
           <div class="row">
             <input type="date" name="date" required aria-labelledby="date-label">
             <div class="chips" aria-label="日付をすばやく選ぶ">
               <button type="button" class="chip" data-date-offset="0">今日</button>
               <button type="button" class="chip" data-date-offset="-1">昨日</button>
+              <button type="button" class="chip" data-date-offset="-2">一昨日</button>
             </div>
           </div>
         </div>
 
-        <div class="field">
+        <div class="field" data-modes="multi">
+          <span class="field-label">日付（タップで複数選択）</span>
+          <div class="cal">
+            <div class="cal-head">
+              <button type="button" class="icon-button" data-cal-nav="-1" aria-label="前の月">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+              </button>
+              <span id="cal-title" aria-live="polite"></span>
+              <button type="button" class="icon-button" data-cal-nav="1" aria-label="次の月">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+              </button>
+            </div>
+            <div class="cal-grid" id="cal-grid" role="group" aria-label="日付"></div>
+          </div>
+          <div class="row cal-foot">
+            <span id="cal-count" class="note">日付を選んでください</span>
+            <button type="button" class="link" id="cal-clear" hidden>選択を解除</button>
+          </div>
+          <p class="note"><span class="dot" aria-hidden="true"></span> そのカテゴリを記録済みの日（同じ日・同じカテゴリは二重に登録しません）</p>
+          <details class="range-fill">
+            <summary>期間と曜日でまとめて選ぶ</summary>
+            <div class="row">
+              <input type="date" id="range-from" aria-label="開始日">
+              <span aria-hidden="true">〜</span>
+              <input type="date" id="range-to" aria-label="終了日">
+            </div>
+            <div class="chips" id="range-weekdays" aria-label="曜日">
+              <button type="button" class="chip" data-wd="1" aria-pressed="true">月</button>
+              <button type="button" class="chip" data-wd="2" aria-pressed="true">火</button>
+              <button type="button" class="chip" data-wd="3" aria-pressed="true">水</button>
+              <button type="button" class="chip" data-wd="4" aria-pressed="true">木</button>
+              <button type="button" class="chip" data-wd="5" aria-pressed="true">金</button>
+              <button type="button" class="chip" data-wd="6" aria-pressed="true">土</button>
+              <button type="button" class="chip" data-wd="0" aria-pressed="true">日</button>
+            </div>
+            <button type="button" class="secondary small" id="range-add">この期間を選択に追加</button>
+          </details>
+        </div>
+
+        <div class="field" data-modes="single multi">
           <label class="field-label" for="event-category">カテゴリ</label>
           <input id="event-category" name="category" list="category-list" required
                  placeholder="alcohol / stress / travel …" maxlength="50" autocomplete="off" autocapitalize="off">
           <datalist id="category-list"></datalist>
-          <div class="chips" id="category-chips" aria-label="よく使うカテゴリ"></div>
           <p class="field-error" id="category-error" hidden>カテゴリを入力してください</p>
         </div>
 
-        <fieldset class="field">
-          <legend class="field-label">強度</legend>
-          <div class="segmented" role="radiogroup">
-            <label><input type="radio" name="intensity" value="" checked><span>なし</span></label>
+        <fieldset class="field" data-modes="single multi">
+          <legend class="field-label-row">
+            <span class="field-label">強度 <output id="intensity-out" class="intensity-out"></output></span>
+            <button type="button" class="link" id="intensity-clear">なしにする</button>
+          </legend>
+          <div class="scale10" role="radiogroup" aria-label="強度 1〜10">
             <label><input type="radio" name="intensity" value="1"><span>1</span></label>
             <label><input type="radio" name="intensity" value="2"><span>2</span></label>
             <label><input type="radio" name="intensity" value="3"><span>3</span></label>
             <label><input type="radio" name="intensity" value="4"><span>4</span></label>
             <label><input type="radio" name="intensity" value="5"><span>5</span></label>
+            <label><input type="radio" name="intensity" value="6"><span>6</span></label>
+            <label><input type="radio" name="intensity" value="7"><span>7</span></label>
+            <label><input type="radio" name="intensity" value="8"><span>8</span></label>
+            <label><input type="radio" name="intensity" value="9"><span>9</span></label>
+            <label><input type="radio" name="intensity" value="10"><span>10</span></label>
           </div>
+          <div class="scale-caption" aria-hidden="true"><span>軽い</span><span>ふつう</span><span>とても強い</span></div>
         </fieldset>
 
-        <div class="field">
+        <div class="field" data-modes="single multi">
           <label class="field-label" for="event-note">メモ</label>
           <textarea id="event-note" name="note" rows="2" maxlength="2000" placeholder="任意"></textarea>
         </div>
 
+        <label class="check" data-modes="single multi">
+          <input type="checkbox" name="save_template"> テンプレートに保存（次から1タップで入力）
+        </label>
+
+        <div class="field" data-modes="paste">
+          <label class="field-label" for="paste-text">1行に1件：日付, カテゴリ, 強度, メモ</label>
+          <textarea id="paste-text" rows="7" spellcheck="false"
+                    placeholder="2026-08-01, alcohol, 6, ビール&#10;8/3, stress, 8&#10;8/5, travel"></textarea>
+          <p class="note">カンマかタブ区切り（スプレッドシートからそのまま貼り付けられます）。日付は 2026-08-01・2026/8/1・8/1（今年）の形。強度（1〜10）とメモは省略できます。同じ日・同じカテゴリの記録が既にあればスキップします。</p>
+          <div id="paste-preview" class="paste-preview" aria-live="polite"></div>
+        </div>
+
         <div class="actions">
-          <button type="submit" class="primary">保存</button>
+          <button type="submit" class="primary" id="event-submit">保存</button>
           <button type="button" id="event-cancel" hidden>キャンセル</button>
         </div>
         <p id="event-msg" class="msg" role="alert"></p>
@@ -157,9 +232,16 @@
           <select id="an-window"><option>1</option><option>2</option><option selected>3</option><option>5</option><option>7</option></select>
         </label>
         <label>強度
-          <select id="an-intensity"><option value="">すべて</option><option value="2">2以上</option><option value="3">3以上</option><option value="4">4以上</option></select>
+          <select id="an-intensity">
+            <option value="">すべて</option><option value="3">3以上</option><option value="5">5以上</option>
+            <option value="7">7以上</option><option value="9">9以上</option>
+          </select>
+        </label>
+        <label>ランの強度の基準
+          <select id="an-run-measure" class="run-measure-select"></select>
         </label>
       </div>
+      <p class="note">強度はイベントでは入力した値（1〜10）。ランは選んだ基準で全ランを並べた順位を1〜10にした値です（上位10%が10）。</p>
 
       <figure class="card">
         <figcaption id="impact-title">イベント前後の変化</figcaption>
@@ -198,6 +280,24 @@
         <p id="dose-summary" class="dose-summary"></p>
         <div class="chart-box short"><canvas id="dose-chart"></canvas></div>
         <div id="dose-table" class="table-wrap"></div>
+      </figure>
+
+      <figure class="card">
+        <figcaption>ランの強度と指標の関係</figcaption>
+        <div class="filters inline">
+          <label>強度 <select id="ri-measure" class="run-measure-select"></select></label>
+          <label>種類 <select id="ri-type" class="run-type-select" data-all="すべてのラン"></select></label>
+          <label>走った日の
+            <select id="ri-lag"><option value="0">当日</option><option value="1" selected>翌日</option><option value="2">翌々日</option></select>
+            の値
+          </label>
+        </div>
+        <p class="note">ランした日を強度で「低・中・高」の3つに分け（ランした日の三分位）、ランしなかった日の平均との差を表示。</p>
+        <p id="ri-summary" class="dose-summary"></p>
+        <div class="chart-box short"><canvas id="ri-chart"></canvas></div>
+        <h3 id="ri-scatter-title">強度ごとの値（1点 = ランした1日）</h3>
+        <div class="chart-box short"><canvas id="ri-scatter"></canvas></div>
+        <div id="ri-table" class="table-wrap"></div>
       </figure>
 
       <p class="note">※ 件数が少ないうちは偶然の差が大きく出ます。効果量 d は |d|≥0.2 小, ≥0.5 中, ≥0.8 大 が目安です。</p>

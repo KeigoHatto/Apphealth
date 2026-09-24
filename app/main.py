@@ -4,6 +4,8 @@ Render 上で動かすバックエンド API。
   POST /webhook/health-export   Health Auto Export からの自動送信（Bearerトークン認証）
   POST /api/import/zip          手動エクスポートZIPのアップロード取り込み
   GET/POST/PUT/DELETE /api/events  日々のイベント手入力
+  POST /api/events/bulk         過去のイベントの一括登録
+  /api/event-templates          よく使うイベントのテンプレート
   GET  /api/metrics/...         日次データ
   GET  /api/workouts/...        ワークアウト
   GET  /api/analysis/...        分析結果
@@ -117,11 +119,11 @@ async def import_zip(file: UploadFile = File(...), conn=Depends(get_db)):
 
 # ---------------------------------------------------------------- イベント
 
-class EventIn(BaseModel):
-    date: date
+class EventContent(BaseModel):
+    """イベントの中身（日付以外）。テンプレートもこの形。"""
     category: str = Field(min_length=1, max_length=50)
     note: str | None = Field(default=None, max_length=2000)
-    intensity: int | None = Field(default=None, ge=1, le=5)
+    intensity: int | None = Field(default=None, ge=1, le=10)
 
     @field_validator("category")
     @classmethod
@@ -130,6 +132,25 @@ class EventIn(BaseModel):
         if not v:
             raise ValueError("category は必須です")
         return v
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, v: str | None) -> str | None:
+        return (v or "").strip() or None
+
+
+class EventIn(EventContent):
+    date: date
+
+
+class BulkEventsIn(BaseModel):
+    events: list[EventIn] = Field(min_length=1, max_length=2000)
+    # 同じ日・同じカテゴリの記録が既にあれば登録しない（同じ貼り付けを2回しても増えない）
+    skip_duplicates: bool = True
+
+
+class IdsIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=2000)
 
 
 def _where(clauses: list[tuple[str, object]]) -> tuple[sql.Composable, list]:
@@ -176,11 +197,90 @@ def delete_event(event_id: int, conn=Depends(get_db)):
     return Response(status_code=204)
 
 
+EVENT_COLUMNS = "id, date, category, note, intensity, created_at"
+
+
+@app.post("/api/events/bulk", status_code=201)
+def create_events_bulk(body: BulkEventsIn, conn=Depends(get_db)):
+    """複数のイベントを1トランザクションで登録する。"""
+    with conn.transaction():
+        existing: set[tuple] = set()
+        if body.skip_duplicates:
+            rows = conn.execute(
+                "select date, category from events where category = any(%s) and date between %s and %s",
+                (list({e.category for e in body.events}),
+                 min(e.date for e in body.events), max(e.date for e in body.events)),
+            )
+            existing = {(r["date"], r["category"]) for r in rows}
+        new = []
+        for e in body.events:
+            key = (e.date, e.category)
+            if body.skip_duplicates and key in existing:
+                continue
+            existing.add(key)
+            new.append(e)
+        created = []
+        if new:
+            created = conn.execute(
+                "insert into events (date, category, note, intensity) "
+                "select * from unnest(%s::date[], %s::text[], %s::text[], %s::smallint[]) "
+                f"returning {EVENT_COLUMNS}",
+                ([e.date for e in new], [e.category for e in new],
+                 [e.note for e in new], [e.intensity for e in new]),
+            ).fetchall()
+    return {"created": len(created), "skipped": len(body.events) - len(created), "events": created}
+
+
+@app.post("/api/events/bulk-delete")
+def delete_events_bulk(body: IdsIn, conn=Depends(get_db)):
+    """一括登録の取り消し用。"""
+    n = conn.execute("delete from events where id = any(%s)", (body.ids,)).rowcount
+    return {"deleted": n}
+
+
 @app.get("/api/events/categories")
 def event_categories(conn=Depends(get_db)):
+    """カテゴリごとの件数と、最後に記録したときの強度（再利用のため）。"""
     return conn.execute(
-        "select category, count(*) as n from events group by category order by n desc, category"
+        "select category, count(*) as n, max(date) as last_date, "
+        "(array_agg(intensity order by date desc, id desc))[1] as last_intensity "
+        "from events group by category order by n desc, category"
     ).fetchall()
+
+
+# ---------------------------------------------------------------- テンプレート
+
+@app.get("/api/event-templates")
+def list_templates(conn=Depends(get_db)):
+    """よく使うものから。使用回数は同じカテゴリのイベント数で数える。"""
+    return conn.execute(
+        "select t.id, t.category, t.intensity, t.note, coalesce(e.n, 0) as n "
+        "from event_templates t "
+        "left join (select category, count(*) as n from events group by category) e using (category) "
+        "order by n desc, t.category, t.intensity nulls first, t.id"
+    ).fetchall()
+
+
+@app.post("/api/event-templates", status_code=201)
+def create_template(t: EventContent, conn=Depends(get_db)):
+    """同じ内容のテンプレートが既にあればそれを返す。"""
+    row = conn.execute(
+        "insert into event_templates (category, intensity, note) values (%s, %s, %s) "
+        "on conflict on constraint event_templates_key do nothing "
+        "returning id, category, intensity, note",
+        (t.category, t.intensity, t.note),
+    ).fetchone()
+    return row or conn.execute(
+        "select id, category, intensity, note from event_templates "
+        "where category = %s and intensity is not distinct from %s and note is not distinct from %s",
+        (t.category, t.intensity, t.note),
+    ).fetchone()
+
+
+@app.delete("/api/event-templates/{template_id}", status_code=204)
+def delete_template(template_id: int, conn=Depends(get_db)):
+    conn.execute("delete from event_templates where id = %s", (template_id,))
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------- メトリクス
@@ -257,13 +357,32 @@ def _named(clauses: list[tuple[str, str, object]]) -> tuple[sql.Composable, dict
             {k: v for _, k, v in active})
 
 
+RunMeasure = Literal["load", "distance", "speed", "duration"]
+
+
+def load_runs(conn, name: str | None = None) -> list[dict]:
+    """ランニング系のワークアウト（距離・速度・負荷付き）。"""
+    where, params = _named([("name = %(name)s", "name", name)])
+    query = sql.SQL("select * from (" + WORKOUTS_SUBQUERY + ") w{} order by start_time").format(where)
+    rows = conn.execute(query, {"tz": config.APP_TIMEZONE, **params}).fetchall()
+    return [{**r, **analysis.run_stats(r)} for r in rows if analysis.is_run(r["name"])]
+
+
+def run_scores(conn, measure: RunMeasure) -> dict[str, int | None]:
+    """ラン1件ごとの強度スコア（1〜10）。全ランの中での順位で決める。"""
+    return analysis.intensity_scores({r["id"]: analysis.run_measure(r, measure) for r in load_runs(conn)})
+
+
 @app.get("/api/workouts")
 def list_workouts(start: date | None = None, end: date | None = None,
-                  name: str | None = None, conn=Depends(get_db)):
+                  name: str | None = None, run_measure: RunMeasure = "load", conn=Depends(get_db)):
     where, params = _named([("date >= %(start)s", "start", start), ("date <= %(end)s", "end", end),
                             ("name = %(name)s", "name", name)])
     query = sql.SQL("select * from (" + WORKOUTS_SUBQUERY + ") w{} order by start_time desc").format(where)
-    return conn.execute(query, {"tz": config.APP_TIMEZONE, **params}).fetchall()
+    rows = conn.execute(query, {"tz": config.APP_TIMEZONE, **params}).fetchall()
+    scores = run_scores(conn, run_measure) if any(analysis.is_run(r["name"]) for r in rows) else {}
+    return [{**r, **analysis.run_stats(r), "is_run": analysis.is_run(r["name"]),
+             "intensity": scores.get(r["id"])} for r in rows]
 
 
 @app.get("/api/workouts/types")
@@ -285,11 +404,12 @@ def workout_minutes_by_date(conn, name: str | None = None) -> dict[date, float]:
 
 # 手入力イベントとワークアウトを「日付 + カテゴリ」の出来事として同じ形で扱う。
 # ワークアウトのカテゴリは 'workout:<種類>'（例: workout:Outdoor Run）
+# ランの強度（1〜10）は run_measure を基準に Python 側で付ける（ref はワークアウトの id）
 OCCURRENCES_SUBQUERY = """
-    select date, category, intensity, note, 'event' as kind from events
+    select date, category, intensity, note, 'event' as kind, id::text as ref from events
     union all
     select date, %(prefix)s || coalesce(name, 'Other'), null,
-           round(duration_min)::int || '分', 'workout'
+           round(duration_min)::int || '分', 'workout', id
     from (""" + WORKOUTS_SUBQUERY + """) w
 """
 
@@ -297,7 +417,8 @@ Kind = Literal["event", "workout", "all"]
 
 
 def load_occurrences(conn, category: str | None = None, kind: Kind = "all",
-                     start: date | None = None, end: date | None = None) -> list[dict]:
+                     start: date | None = None, end: date | None = None,
+                     run_measure: RunMeasure = "load") -> list[dict]:
     where, params = _named([
         ("category = %(category)s", "category", category),
         ("kind = %(kind)s", "kind", None if kind == "all" else kind),
@@ -305,14 +426,25 @@ def load_occurrences(conn, category: str | None = None, kind: Kind = "all",
         ("date <= %(end)s", "end", end),
     ])
     query = sql.SQL("select * from (" + OCCURRENCES_SUBQUERY + ") o{} order by date, category").format(where)
-    return conn.execute(query, {"tz": config.APP_TIMEZONE, "prefix": analysis.WORKOUT_PREFIX,
+    rows = conn.execute(query, {"tz": config.APP_TIMEZONE, "prefix": analysis.WORKOUT_PREFIX,
                                 **params}).fetchall()
+    if any(r["kind"] == "workout" and analysis.has_intensity(r["category"]) for r in rows):
+        runs = {r["id"]: r for r in load_runs(conn)}
+        scores = analysis.intensity_scores({k: analysis.run_measure(r, run_measure) for k, r in runs.items()})
+        for r in rows:
+            run = runs.get(r["ref"]) if r["kind"] == "workout" else None
+            if run:
+                r["intensity"] = scores.get(r["ref"])
+                if run["distance_km"] is not None:
+                    r["note"] += f" · {run['distance_km']:.1f}km"
+    return rows
 
 
 @app.get("/api/occurrences")
 def occurrences(start: date | None = None, end: date | None = None,
-                category: str | None = None, kind: Kind = "all", conn=Depends(get_db)):
-    return load_occurrences(conn, category, kind, start, end)
+                category: str | None = None, kind: Kind = "all",
+                run_measure: RunMeasure = "load", conn=Depends(get_db)):
+    return load_occurrences(conn, category, kind, start, end, run_measure)
 
 
 @app.get("/api/analysis/categories")
@@ -325,9 +457,10 @@ def analysis_categories(conn=Depends(get_db)):
 @app.get("/api/analysis/event-impact")
 def event_impact(metric: str, category: str,
                  window: int = Query(3, ge=1, le=14),
-                 min_intensity: int | None = Query(None, ge=1, le=5),
-                 conn=Depends(get_db)):
-    events = analysis.filter_events(load_occurrences(conn, category), category, min_intensity)
+                 min_intensity: int | None = Query(None, ge=1, le=10),
+                 run_measure: RunMeasure = "load", conn=Depends(get_db)):
+    events = analysis.filter_events(load_occurrences(conn, category, run_measure=run_measure),
+                                    category, min_intensity)
     dates = analysis.event_dates(events)
     if dates:
         series = load_series(conn, metric, dates[0] - timedelta(days=window + 60),
@@ -340,9 +473,11 @@ def event_impact(metric: str, category: str,
 
 @app.get("/api/analysis/category-comparison")
 def category_comparison(metric: str, lag: int = Query(1, ge=0, le=14),
-                        min_intensity: int | None = Query(None, ge=1, le=5),
-                        kind: Kind = "event", conn=Depends(get_db)):
-    events = analysis.filter_events(load_occurrences(conn, kind=kind), None, min_intensity)
+                        min_intensity: int | None = Query(None, ge=1, le=10),
+                        kind: Kind = "event", run_measure: RunMeasure = "load",
+                        conn=Depends(get_db)):
+    events = analysis.filter_events(load_occurrences(conn, kind=kind, run_measure=run_measure),
+                                    None, min_intensity)
     series = load_series(conn, metric)
     return {"metric": metric, "kind": kind, **analysis.category_comparison(series, events, lag)}
 
@@ -354,6 +489,18 @@ def workout_dose(metric: str, lag: int = Query(1, ge=0, le=7), name: str | None 
     minutes = workout_minutes_by_date(conn, name)
     series = load_series(conn, metric)
     return {"metric": metric, "name": name, **analysis.workout_dose(series, minutes, lag)}
+
+
+@app.get("/api/analysis/run-intensity")
+def run_intensity(metric: str, measure: RunMeasure = "load", lag: int = Query(1, ge=0, le=7),
+                  name: str | None = None, conn=Depends(get_db)):
+    """ランの強度（距離・速度・距離×速度・時間）で日を分けて、lag 日後の指標を比較する。"""
+    runs = load_runs(conn, name)
+    series = load_series(conn, metric)
+    label, unit = analysis.RUN_MEASURES[measure]
+    return {"metric": metric, "measure": measure, "measure_label": label, "measure_unit": unit,
+            "name": name,
+            **analysis.run_intensity(series, analysis.run_day_measures(runs, measure), lag)}
 
 
 @app.exception_handler(RuntimeError)

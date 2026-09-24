@@ -19,7 +19,7 @@ from tests.sample_payload import SAMPLE
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL が未設定")
 
-TABLES = "health_metrics, sleep_sessions, workouts, heart_rate_notifications, events"
+TABLES = "health_metrics, sleep_sessions, workouts, heart_rate_notifications, events, event_templates"
 
 
 def rows(conn, table):
@@ -108,17 +108,74 @@ def test_events_crud(fake, http):
     ev = r.json()
     assert ev["category"] == "alcohol"
 
-    assert http.post("/api/events", json={"date": "2026-08-24", "category": "x", "intensity": 9}).status_code == 422
+    assert http.post("/api/events", json={"date": "2026-08-24", "category": "x", "intensity": 11}).status_code == 422
+    assert http.post("/api/events", json={"date": "2026-08-24", "category": "x", "intensity": 10}).status_code == 201
     assert http.post("/api/events", json={"date": "2026-08-24", "category": "  "}).status_code == 422
 
     r = http.put(f"/api/events/{ev['id']}", json={"date": "2026-08-25", "category": "stress", "note": "締切"})
     assert r.json()["note"] == "締切"
     assert http.put("/api/events/999", json={"date": "2026-08-25", "category": "x"}).status_code == 404
 
-    assert http.get("/api/events/categories").json() == [{"category": "stress", "n": 1}]
+    assert http.get("/api/events/categories").json() == [
+        {"category": "stress", "n": 1, "last_date": "2026-08-25", "last_intensity": None},
+        {"category": "x", "n": 1, "last_date": "2026-08-24", "last_intensity": 10}]
     assert len(http.get("/api/events", params={"start": "2026-08-25"}).json()) == 1
     assert http.delete(f"/api/events/{ev['id']}").status_code == 204
-    assert http.get("/api/events").json() == []
+    assert [e["category"] for e in http.get("/api/events").json()] == ["x"]
+
+
+def test_events_bulk(fake, http):
+    http.post("/api/events", json={"date": "2026-08-02", "category": "alcohol", "intensity": 4})
+    body = {"events": [
+        {"date": "2026-08-01", "category": "Alcohol", "intensity": 6, "note": " ビール "},
+        {"date": "2026-08-02", "category": "alcohol", "intensity": 6},   # 既にある
+        {"date": "2026-08-03", "category": "alcohol", "intensity": 6},
+        {"date": "2026-08-03", "category": "alcohol", "intensity": 6},   # 同じ貼り付け内の重複
+        {"date": "2026-08-03", "category": "stress"},
+    ]}
+    r = http.post("/api/events/bulk", json=body)
+    assert r.status_code == 201, r.text
+    assert (r.json()["created"], r.json()["skipped"]) == (3, 2)
+    created = r.json()["events"]
+    assert created[0]["note"] == "ビール" and created[0]["category"] == "alcohol"
+    assert len(http.get("/api/events").json()) == 4
+
+    r = http.post("/api/events/bulk", json={**body, "skip_duplicates": False})
+    assert r.json()["created"] == 5
+
+    # 1件でも不正なら何も登録しない
+    bad = {"events": [{"date": "2026-08-09", "category": "ok"}, {"date": "2026-08-10", "category": "x", "intensity": 0}]}
+    assert http.post("/api/events/bulk", json=bad).status_code == 422
+    assert http.post("/api/events/bulk", json={"events": []}).status_code == 422
+
+    r = http.post("/api/events/bulk-delete", json={"ids": [e["id"] for e in created]})
+    assert r.json() == {"deleted": 3}
+    assert len(http.get("/api/events").json()) == 6
+
+
+def test_event_templates(fake, http):
+    t = http.post("/api/event-templates", json={"category": " Alcohol ", "intensity": 7, "note": "ワイン"})
+    assert t.status_code == 201, t.text
+    again = http.post("/api/event-templates", json={"category": "alcohol", "intensity": 7, "note": "ワイン"})
+    assert again.json()["id"] == t.json()["id"]
+    http.post("/api/event-templates", json={"category": "stress"})
+    http.post("/api/event-templates", json={"category": "stress", "note": ""})  # note 空 = なし
+    http.post("/api/events", json={"date": "2026-08-01", "category": "stress"})
+
+    ts = http.get("/api/event-templates").json()
+    assert [(x["category"], x["intensity"], x["note"], x["n"]) for x in ts] == [
+        ("stress", None, None, 1), ("alcohol", 7, "ワイン", 0)]
+    assert http.delete(f"/api/event-templates/{t.json()['id']}").status_code == 204
+    assert len(http.get("/api/event-templates").json()) == 1
+
+
+def test_intensity_migration_rescales_once(fake):
+    fake.execute("delete from schema_migrations where name = 'events_intensity_10'")
+    fake.execute("alter table events drop constraint events_intensity_check")
+    fake.execute("insert into events (date, category, intensity) values ('2026-08-01', 'a', 3), ('2026-08-02', 'b', null)")
+    db.init_schema(fake)
+    db.init_schema(fake)  # 2回目は何もしない
+    assert [r["intensity"] for r in fake.execute("select intensity from events order by date")] == [6, None]
 
 
 def test_metrics_and_analysis(fake, http):
@@ -181,6 +238,8 @@ def test_workouts_endpoints_and_analysis(fake, http):
     run = ws[2]
     assert (run["date"], run["start_local"], run["duration_min"], run["distance_qty"]) == (
         "2026-08-10", "23:30", 45, 7.5)
+    assert (run["is_run"], run["speed_kmh"], run["pace_min_km"], run["intensity"]) == (True, 10, 6, 10)
+    assert (ws[0]["is_run"], ws[0]["intensity"]) == (False, None)
     assert len(http.get("/api/workouts", params={"start": "2026-08-15", "name": "Outdoor Run"}).json()) == 1
 
     types = http.get("/api/workouts/types").json()
@@ -189,17 +248,27 @@ def test_workouts_endpoints_and_analysis(fake, http):
     occ = http.get("/api/occurrences", params={"start": "2026-08-01", "end": "2026-08-12"}).json()
     assert [(o["date"], o["category"], o["kind"]) for o in occ] == [
         ("2026-08-05", "alcohol", "event"), ("2026-08-10", "workout:Outdoor Run", "workout")]
-    assert occ[1]["note"] == "45分"
+    assert occ[1]["note"] == "45分 · 7.5km"
+    assert occ[1]["intensity"] == 10  # 距離が分かるランは w1 だけなので最上位
 
     cats = {(c["category"], c["kind"]): c["n"] for c in http.get("/api/analysis/categories").json()}
     assert cats == {("alcohol", "event"): 1, ("workout:Outdoor Run", "workout"): 2, ("workout:Yoga", "workout"): 1}
 
     r = http.get("/api/analysis/event-impact", params={
-        "metric": "heart_rate_variability", "category": "workout:Outdoor Run", "window": 1,
-        "min_intensity": 3}).json()
+        "metric": "heart_rate_variability", "category": "workout:Outdoor Run", "window": 1}).json()
     assert r["n_events"] == 2
     lag1 = next(l for l in r["lags"] if l["lag"] == 1)
     assert lag1["event"]["mean"] == 60
+    # 強度で絞ると、距離が分からない w2 は外れる
+    r = http.get("/api/analysis/event-impact", params={
+        "metric": "heart_rate_variability", "category": "workout:Outdoor Run", "window": 1,
+        "min_intensity": 3}).json()
+    assert r["n_events"] == 1
+    # 時間を基準にすれば w2 にも強度が付く（45分 → 10, 30分 → 5）
+    r = http.get("/api/analysis/event-impact", params={
+        "metric": "heart_rate_variability", "category": "workout:Outdoor Run", "window": 1,
+        "min_intensity": 5, "run_measure": "duration"}).json()
+    assert r["n_events"] == 2
 
     r = http.get("/api/analysis/category-comparison",
                  params={"metric": "heart_rate_variability", "lag": 1, "kind": "workout"}).json()
@@ -218,3 +287,34 @@ def test_workouts_endpoints_and_analysis(fake, http):
     r = http.get("/api/analysis/workout-dose",
                  params={"metric": "heart_rate_variability", "name": "Yoga"}).json()
     assert r["points"][0]["date"] == "2026-08-18"
+
+
+def test_run_intensity_endpoint(fake, http):
+    # 距離 3 / 6 / 12 km のランを3日おきに。長いほど翌日の HRV が下がる
+    metrics = [{"date": f"2026-07-{day:02d} 00:00:00 +0900", "qty": 50, "source": "Apple Watch"}
+               for day in range(1, 31)]
+    workouts = []
+    for n, day in enumerate(range(1, 28, 3)):
+        km = [3, 6, 12][n % 3]
+        metrics[day]["qty"] = 50 - km  # day+1 日（0始まりの添字 = day）
+        workouts.append({"id": f"r{n}", "name": "Outdoor Run", "start": f"2026-07-{day:02d} 06:00:00 +0900",
+                         "end": f"2026-07-{day:02d} {6 + km * 5 // 60:02d}:{km * 5 % 60:02d}:00 +0900",
+                         "distance": {"qty": km, "units": "km"}})
+    workouts.append({"id": "y1", "name": "Yoga", "start": "2026-07-02 07:00:00 +0900",
+                     "end": "2026-07-02 08:00:00 +0900"})
+    _post(http, {"data": {"metrics": [{"name": "heart_rate_variability", "units": "ms", "data": metrics}],
+                          "workouts": workouts}})
+
+    r = http.get("/api/analysis/run-intensity",
+                 params={"metric": "heart_rate_variability", "measure": "distance"}).json()
+    assert (r["measure_label"], r["measure_unit"], r["n_runs"]) == ("距離", "km", 9)
+    bins = {b["label"]: b for b in r["bins"]}
+    assert bins["なし"]["mean"] == 50
+    assert (bins["低"]["diff"], bins["中"]["diff"], bins["高"]["diff"]) == (-3, -6, -12)
+    assert r["r"] < -0.99
+    # 速度は全ラン同じ（12km/h）なので相関は出ない
+    r = http.get("/api/analysis/run-intensity",
+                 params={"metric": "heart_rate_variability", "measure": "speed"}).json()
+    assert r["r"] is None
+    assert http.get("/api/analysis/run-intensity",
+                    params={"metric": "heart_rate_variability", "measure": "nope"}).status_code == 422

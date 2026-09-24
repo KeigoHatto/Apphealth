@@ -37,7 +37,7 @@ Apple Watchの健康データ（心拍・睡眠・活動量など）と、日々
 | `sleep_sessions` | 睡眠セッション専用（`sleep_analysis`から分離） |
 | `workouts` | ワークアウト単位のサマリー。GPXファイル名も紐付け |
 | `heart_rate_notifications` | 心拍アラート履歴 |
-| `events` | **ユーザーが手入力する日々のイベント**。`date`, `category`（例: alcohol/stress/travel等、自由運用）, `note`, `intensity`（1〜5の自己申告強度） |
+| `events` | **ユーザーが手入力する日々のイベント**。`date`, `category`（例: alcohol/stress/travel等、自由運用）, `note`, `intensity`（1〜10の自己申告強度）。よく使う内容は `event_templates` に保存して使い回す |
 
 重複防止のため `health_metrics` は `(date, metric_name, source)`、`sleep_sessions` は `(date, source)` でunique制約。
 
