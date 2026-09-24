@@ -61,3 +61,13 @@ def test_extract_data_accepts_wrapped_and_bare():
     assert parsing.extract_data(SAMPLE) is SAMPLE["data"]
     assert parsing.extract_data(SAMPLE["data"]) is SAMPLE["data"]
     assert parsing.extract_data([]) == {}
+
+
+def test_workout_duration_prefers_start_end():
+    rows = parsing.build_workout_rows([
+        {"id": "a", "start": "2026-08-24 06:30:00 +0900", "end": "2026-08-24 07:15:30 +0900", "duration": 2730},
+        {"id": "b", "duration": 2730},   # 秒で来たとみなす
+        {"id": "c", "duration": 45},     # 分とみなす
+    ])
+    by_id = {r["id"]: r["duration_min"] for r in rows}
+    assert by_id == {"a": 45.5, "b": 45.5, "c": 45}

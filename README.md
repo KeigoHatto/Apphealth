@@ -33,8 +33,13 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 | GET | `/api/events/categories` | カテゴリと件数 |
 | GET | `/api/metrics/catalog` | 取り込み済み指標の一覧 |
 | GET | `/api/metrics/daily?metric=&start=&end=` | 1日1値の系列（`sleep_total` 等の睡眠指標も可） |
-| GET | `/api/analysis/event-impact?metric=&category=&window=3` | イベント前後の変化 + ラグ別比較 |
-| GET | `/api/analysis/category-comparison?metric=&lag=1` | カテゴリ別の比較 |
+| GET | `/api/workouts?start=&end=&name=` | ワークアウト一覧（`date` と `start_local` は `APP_TIMEZONE` 基準） |
+| GET | `/api/workouts/types` | ワークアウトの種類ごとの回数・合計時間 |
+| GET | `/api/occurrences?start=&end=&category=&kind=` | イベントとワークアウトを日付ごとにまとめた一覧 |
+| GET | `/api/analysis/categories` | 分析に使えるカテゴリ（イベント + `workout:<種類>`） |
+| GET | `/api/analysis/event-impact?metric=&category=&window=3` | イベント（またはワークアウト）前後の変化 + ラグ別比較 |
+| GET | `/api/analysis/category-comparison?metric=&lag=1&kind=event` | カテゴリ別の比較（`kind=workout` でワークアウトの種類別） |
+| GET | `/api/analysis/workout-dose?metric=&lag=1&name=` | その日の運動時間と N 日後の指標の関係（区分別の平均・相関係数） |
 
 `/webhook/*` と `/healthz` 以外は `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` の Basic 認証で保護されます。
 
@@ -42,6 +47,10 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 - **前後の変化**: 各イベントについて直前 `window` 日の平均をベースラインとし、-window〜+window 日の値との差を平均。
 - **ラグ別比較**: 「イベント日 + N 日」の値と、どのイベントの 0〜window 日後にも当たらない日の値を比較（差と効果量 Cohen's d）。
 - **カテゴリ別比較**: 各カテゴリの「イベント日 + lag 日」の値と、イベントのない日の値を比較。
+- **ワークアウト**: 各ワークアウトを `workout:<種類>` というカテゴリの出来事として扱うので、上の分析がそのまま使える。
+  強度の絞り込みは手入力イベントにだけ適用。ワークアウト時間は開始〜終了時刻から計算する。
+- **運動時間と指標**: その日の運動時間の合計（なし / 1〜30分 / 31〜60分 / 61分以上）で日を分け、N 日後の指標の平均を比較。相関係数も表示。
+  ワークアウト記録の最初の日より前は対象外。
 - 1日1値への集約: 心拍などの統計型は `Avg`、それ以外は `qty`。同じ日に複数 source があれば平均。
 
 ## セットアップ

@@ -5,6 +5,7 @@ Render 上で動かすバックエンド API。
   POST /api/import/zip          手動エクスポートZIPのアップロード取り込み
   GET/POST/PUT/DELETE /api/events  日々のイベント手入力
   GET  /api/metrics/...         日次データ
+  GET  /api/workouts/...        ワークアウト
   GET  /api/analysis/...        分析結果
   GET  /                        ダッシュボード（static/）
 
@@ -20,6 +21,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
@@ -230,12 +232,94 @@ def sleep_sessions(start: date | None = None, end: date | None = None, conn=Depe
     return conn.execute(query, params).fetchall()
 
 
+# ---------------------------------------------------------------- ワークアウト
+
+# ワークアウト1件1行。date は開始時刻を APP_TIMEZONE の日付にしたもの。
+# 時間は開始〜終了から計算できればそれを使う（duration の単位がバージョンで揺れるため）。
+WORKOUTS_SUBQUERY = """
+    select id, (start_time at time zone %(tz)s)::date as date,
+           to_char(start_time at time zone %(tz)s, 'HH24:MI') as start_local,
+           name, start_time, end_time,
+           coalesce(extract(epoch from (end_time - start_time)) / 60, duration_min) as duration_min,
+           distance_qty, distance_units, active_energy_qty, active_energy_units,
+           avg_speed, speed_units, is_indoor
+    from workouts
+    where start_time is not null
+"""
+
+
+def _named(clauses: list[tuple[str, str, object]]) -> tuple[sql.Composable, dict]:
+    """[("date >= %(start)s", "start", value), ...] から名前付きパラメータの WHERE 句を作る。"""
+    active = [(c, k, v) for c, k, v in clauses if v is not None]
+    if not active:
+        return sql.SQL(""), {}
+    return (sql.SQL(" where ") + sql.SQL(" and ").join(sql.SQL(c) for c, _, _ in active),
+            {k: v for _, k, v in active})
+
+
+@app.get("/api/workouts")
+def list_workouts(start: date | None = None, end: date | None = None,
+                  name: str | None = None, conn=Depends(get_db)):
+    where, params = _named([("date >= %(start)s", "start", start), ("date <= %(end)s", "end", end),
+                            ("name = %(name)s", "name", name)])
+    query = sql.SQL("select * from (" + WORKOUTS_SUBQUERY + ") w{} order by start_time desc").format(where)
+    return conn.execute(query, {"tz": config.APP_TIMEZONE, **params}).fetchall()
+
+
+@app.get("/api/workouts/types")
+def workout_types(conn=Depends(get_db)):
+    query = ("select coalesce(name, 'Other') as name, count(*) as n, sum(duration_min) as total_min, "
+             "max(date) as last_date from (" + WORKOUTS_SUBQUERY + ") w group by 1 order by n desc, name")
+    return conn.execute(query, {"tz": config.APP_TIMEZONE}).fetchall()
+
+
+def workout_minutes_by_date(conn, name: str | None = None) -> dict[date, float]:
+    where, params = _named([("name = %(name)s", "name", name)])
+    query = sql.SQL("select date, sum(duration_min) as minutes from (" + WORKOUTS_SUBQUERY + ") w{} "
+                    "group by date").format(where)
+    rows = conn.execute(query, {"tz": config.APP_TIMEZONE, **params})
+    return {r["date"]: r["minutes"] or 0.0 for r in rows}
+
+
 # ---------------------------------------------------------------- 分析
 
-def _load_events(conn, category: str | None = None) -> list[dict]:
-    where, params = _where([("category = %s", category)])
-    query = sql.SQL("select id, date, category, intensity from events{} order by date, id").format(where)
-    return conn.execute(query, params).fetchall()
+# 手入力イベントとワークアウトを「日付 + カテゴリ」の出来事として同じ形で扱う。
+# ワークアウトのカテゴリは 'workout:<種類>'（例: workout:Outdoor Run）
+OCCURRENCES_SUBQUERY = """
+    select date, category, intensity, note, 'event' as kind from events
+    union all
+    select date, %(prefix)s || coalesce(name, 'Other'), null,
+           round(duration_min)::int || '分', 'workout'
+    from (""" + WORKOUTS_SUBQUERY + """) w
+"""
+
+Kind = Literal["event", "workout", "all"]
+
+
+def load_occurrences(conn, category: str | None = None, kind: Kind = "all",
+                     start: date | None = None, end: date | None = None) -> list[dict]:
+    where, params = _named([
+        ("category = %(category)s", "category", category),
+        ("kind = %(kind)s", "kind", None if kind == "all" else kind),
+        ("date >= %(start)s", "start", start),
+        ("date <= %(end)s", "end", end),
+    ])
+    query = sql.SQL("select * from (" + OCCURRENCES_SUBQUERY + ") o{} order by date, category").format(where)
+    return conn.execute(query, {"tz": config.APP_TIMEZONE, "prefix": analysis.WORKOUT_PREFIX,
+                                **params}).fetchall()
+
+
+@app.get("/api/occurrences")
+def occurrences(start: date | None = None, end: date | None = None,
+                category: str | None = None, kind: Kind = "all", conn=Depends(get_db)):
+    return load_occurrences(conn, category, kind, start, end)
+
+
+@app.get("/api/analysis/categories")
+def analysis_categories(conn=Depends(get_db)):
+    query = sql.SQL("select category, kind, count(*) as n from (" + OCCURRENCES_SUBQUERY + ") o "
+                    "group by category, kind order by kind, n desc, category")
+    return conn.execute(query, {"tz": config.APP_TIMEZONE, "prefix": analysis.WORKOUT_PREFIX}).fetchall()
 
 
 @app.get("/api/analysis/event-impact")
@@ -243,7 +327,7 @@ def event_impact(metric: str, category: str,
                  window: int = Query(3, ge=1, le=14),
                  min_intensity: int | None = Query(None, ge=1, le=5),
                  conn=Depends(get_db)):
-    events = analysis.filter_events(_load_events(conn, category), category, min_intensity)
+    events = analysis.filter_events(load_occurrences(conn, category), category, min_intensity)
     dates = analysis.event_dates(events)
     if dates:
         series = load_series(conn, metric, dates[0] - timedelta(days=window + 60),
@@ -257,10 +341,19 @@ def event_impact(metric: str, category: str,
 @app.get("/api/analysis/category-comparison")
 def category_comparison(metric: str, lag: int = Query(1, ge=0, le=14),
                         min_intensity: int | None = Query(None, ge=1, le=5),
-                        conn=Depends(get_db)):
-    events = analysis.filter_events(_load_events(conn), None, min_intensity)
+                        kind: Kind = "event", conn=Depends(get_db)):
+    events = analysis.filter_events(load_occurrences(conn, kind=kind), None, min_intensity)
     series = load_series(conn, metric)
-    return {"metric": metric, **analysis.category_comparison(series, events, lag)}
+    return {"metric": metric, "kind": kind, **analysis.category_comparison(series, events, lag)}
+
+
+@app.get("/api/analysis/workout-dose")
+def workout_dose(metric: str, lag: int = Query(1, ge=0, le=7), name: str | None = None,
+                 conn=Depends(get_db)):
+    """その日の運動時間と lag 日後の指標の関係。"""
+    minutes = workout_minutes_by_date(conn, name)
+    series = load_series(conn, metric)
+    return {"metric": metric, "name": name, **analysis.workout_dose(series, minutes, lag)}
 
 
 @app.exception_handler(RuntimeError)

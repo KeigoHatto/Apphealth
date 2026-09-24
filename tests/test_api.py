@@ -153,3 +153,68 @@ def test_basic_auth(fake, http, monkeypatch):
     assert http.get("/healthz").status_code == 200
     r = http.post("/webhook/health-export", json=SAMPLE, headers={"Authorization": "Bearer secret-token"})
     assert r.status_code == 200
+
+
+def _post(http, payload):
+    r = http.post("/webhook/health-export", json=payload, headers={"Authorization": "Bearer secret-token"})
+    assert r.status_code == 200, r.text
+
+
+def test_workouts_endpoints_and_analysis(fake, http):
+    metrics = [{"date": f"2026-08-{day:02d} 00:00:00 +0900", "qty": 50 + (10 if day in (11, 16) else 0),
+                "source": "Apple Watch"} for day in range(1, 21)]
+    workouts = [
+        # 23:30 JST 開始 → UTC では前日ではなく、JST の日付（8/10）として扱われること
+        {"id": "w1", "name": "Outdoor Run", "start": "2026-08-10 23:30:00 +0900",
+         "end": "2026-08-11 00:15:00 +0900", "distance": {"qty": 7.5, "units": "km"}},
+        {"id": "w2", "name": "Outdoor Run", "start": "2026-08-15 07:00:00 +0900",
+         "end": "2026-08-15 07:30:00 +0900"},
+        {"id": "w3", "name": "Yoga", "start": "2026-08-18 20:00:00 +0900",
+         "end": "2026-08-18 20:20:00 +0900"},
+    ]
+    _post(http, {"data": {"metrics": [{"name": "heart_rate_variability", "units": "ms", "data": metrics}],
+                          "workouts": workouts}})
+    http.post("/api/events", json={"date": "2026-08-05", "category": "alcohol"})
+
+    ws = http.get("/api/workouts").json()
+    assert [w["id"] for w in ws] == ["w3", "w2", "w1"]
+    run = ws[2]
+    assert (run["date"], run["start_local"], run["duration_min"], run["distance_qty"]) == (
+        "2026-08-10", "23:30", 45, 7.5)
+    assert len(http.get("/api/workouts", params={"start": "2026-08-15", "name": "Outdoor Run"}).json()) == 1
+
+    types = http.get("/api/workouts/types").json()
+    assert types[0] == {"name": "Outdoor Run", "n": 2, "total_min": 75, "last_date": "2026-08-15"}
+
+    occ = http.get("/api/occurrences", params={"start": "2026-08-01", "end": "2026-08-12"}).json()
+    assert [(o["date"], o["category"], o["kind"]) for o in occ] == [
+        ("2026-08-05", "alcohol", "event"), ("2026-08-10", "workout:Outdoor Run", "workout")]
+    assert occ[1]["note"] == "45分"
+
+    cats = {(c["category"], c["kind"]): c["n"] for c in http.get("/api/analysis/categories").json()}
+    assert cats == {("alcohol", "event"): 1, ("workout:Outdoor Run", "workout"): 2, ("workout:Yoga", "workout"): 1}
+
+    r = http.get("/api/analysis/event-impact", params={
+        "metric": "heart_rate_variability", "category": "workout:Outdoor Run", "window": 1,
+        "min_intensity": 3}).json()
+    assert r["n_events"] == 2
+    lag1 = next(l for l in r["lags"] if l["lag"] == 1)
+    assert lag1["event"]["mean"] == 60
+
+    r = http.get("/api/analysis/category-comparison",
+                 params={"metric": "heart_rate_variability", "lag": 1, "kind": "workout"}).json()
+    assert [c["category"] for c in r["categories"]] == ["workout:Outdoor Run", "workout:Yoga"]
+    r = http.get("/api/analysis/category-comparison",
+                 params={"metric": "heart_rate_variability", "lag": 1}).json()
+    assert [c["category"] for c in r["categories"]] == ["alcohol"]
+
+    r = http.get("/api/analysis/workout-dose", params={"metric": "heart_rate_variability", "lag": 1}).json()
+    bins = {b["label"]: b for b in r["bins"]}
+    # 45分のラン(8/10→8/11=60) / 30分のラン(8/15→8/16=60) と 20分のヨガ(8/18→8/19=50)
+    assert (bins["31〜60分"]["n"], bins["31〜60分"]["mean"]) == (1, 60)
+    assert (bins["1〜30分"]["n"], bins["1〜30分"]["mean"]) == (2, 55)
+    assert bins["なし"]["mean"] == 50
+    assert r["points"][0]["date"] == "2026-08-10"
+    r = http.get("/api/analysis/workout-dose",
+                 params={"metric": "heart_rate_variability", "name": "Yoga"}).json()
+    assert r["points"][0]["date"] == "2026-08-18"

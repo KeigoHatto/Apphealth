@@ -67,13 +67,22 @@ def _compare(event_values: list[float], control_values: list[float]) -> dict:
             "cohens_d": cohens_d(event_values, control_values)}
 
 
+WORKOUT_PREFIX = "workout:"
+
+
+def is_workout(category: str) -> bool:
+    return category.startswith(WORKOUT_PREFIX)
+
+
 def filter_events(events: Iterable[dict], category: str | None = None,
                   min_intensity: int | None = None) -> list[dict]:
+    """強度の絞り込みは手入力イベントだけに適用する（ワークアウトには強度がない）。"""
     out = []
     for e in events:
         if category and e.get("category") != category:
             continue
-        if min_intensity is not None and (e.get("intensity") or 0) < min_intensity:
+        if (min_intensity is not None and not is_workout(e["category"])
+                and (e.get("intensity") or 0) < min_intensity):
             continue
         out.append(e)
     return out
@@ -140,3 +149,49 @@ def category_comparison(series: dict[date, float], events: list[dict], lag: int 
         categories.append({"category": category, **_compare(values, control)})
 
     return {"lag": lag, "control": _summary(control), "categories": categories}
+
+
+def pearson_r(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 3:
+        return None
+    try:
+        return statistics.correlation(xs, ys)
+    except statistics.StatisticsError:  # どちらかが定数
+        return None
+
+
+# 運動量の区分（分）: (ラベル, 下限, 上限)。下限・上限とも含む
+DOSE_BINS = [("なし", 0, 0), ("1〜30分", 0.01, 30), ("31〜60分", 30.01, 60), ("61分以上", 60.01, math.inf)]
+
+
+def workout_dose(series: dict[date, float], minutes_by_date: dict[date, float], lag: int = 1) -> dict:
+    """
+    その日の運動時間（分, ワークアウトがない日は0）と、lag 日後の指標の関係。
+    series の範囲内で、運動データの最初の日以降だけを対象にする（記録開始前の「0分」を混ぜないため）。
+    """
+    points = []
+    if minutes_by_date:
+        first = min(minutes_by_date)
+        for d in sorted(series):
+            source_day = d - timedelta(days=lag)
+            if source_day < first:
+                continue
+            points.append({"date": source_day.isoformat(),
+                           "minutes": minutes_by_date.get(source_day, 0.0),
+                           "value": series[d]})
+
+    bins = []
+    for label, lo, hi in DOSE_BINS:
+        values = [p["value"] for p in points if lo <= p["minutes"] <= hi]
+        bins.append({"label": label, **_summary(values)})
+    base = bins[0]["mean"]
+    for b in bins:
+        b["diff"] = None if base is None or b["mean"] is None else b["mean"] - base
+
+    return {
+        "lag": lag,
+        "n": len(points),
+        "r": pearson_r([p["minutes"] for p in points], [p["value"] for p in points]),
+        "bins": bins,
+        "points": points,
+    }

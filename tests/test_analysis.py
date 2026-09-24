@@ -61,3 +61,32 @@ def test_filter_events_by_intensity():
 def test_cohens_d():
     assert analysis.cohens_d([1, 2, 3], [4, 5, 6]) == pytest.approx(-3.0)
     assert analysis.cohens_d([1], [2, 3]) is None
+
+
+def test_workout_dose_bins_and_correlation():
+    # 運動した翌日ほど値が高い
+    series = {d(i): 50.0 for i in range(1, 30)}
+    minutes = {}
+    for i in range(0, 28, 3):
+        minutes[d(i)] = 20.0 if i % 2 else 70.0
+        series[d(i + 1)] = 55.0 if i % 2 else 60.0
+    r = analysis.workout_dose(series, minutes, lag=1)
+    bins = {b["label"]: b for b in r["bins"]}
+    assert bins["なし"]["mean"] == 50
+    assert bins["1〜30分"]["mean"] == 55
+    assert bins["61分以上"]["diff"] == 10
+    assert bins["31〜60分"]["n"] == 0
+    assert r["r"] > 0.8
+    # 運動データの最初の日より前は対象外
+    assert min(p["date"] for p in r["points"]) == d(0).isoformat()
+
+
+def test_workout_dose_without_workouts():
+    r = analysis.workout_dose({d(0): 1.0}, {}, lag=1)
+    assert r["n"] == 0 and r["r"] is None
+
+
+def test_intensity_filter_skips_workouts():
+    events = [{"category": "workout:Outdoor Run", "intensity": None},
+              {"category": "alcohol", "intensity": 1}]
+    assert [e["category"] for e in analysis.filter_events(events, None, 3)] == ["workout:Outdoor Run"]

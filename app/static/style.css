@@ -95,6 +95,8 @@ button.link.danger { color: var(--danger); }
 .msg.error { color: var(--danger); }
 
 .chart-box { position: relative; height: 320px; }
+.chart-box.short { height: 240px; }
+.dose-summary { margin: 4px 0 8px; font-size: 14px; }
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .stat { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; }
 .stat .label { font-size: 12px; color: var(--text-muted); }

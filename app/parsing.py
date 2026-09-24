@@ -143,6 +143,22 @@ def _qty_units(obj: Any) -> tuple[float | None, str | None]:
     return to_number(obj), None
 
 
+def _duration_min(w: dict, start_iso: str | None, end_iso: str | None) -> float | None:
+    """
+    ワークアウト時間（分）。Health Auto Export の duration は秒で来るバージョンがあり単位が
+    はっきりしないので、開始・終了時刻から計算できるときはそちらを優先する。
+    """
+    if start_iso and end_iso:
+        seconds = (datetime.fromisoformat(end_iso) - datetime.fromisoformat(start_iso)).total_seconds()
+        if seconds >= 0:
+            return round(seconds / 60, 2)
+    duration = to_number(w.get("duration"))
+    if duration is None:
+        return None
+    # 5時間(300分)を超える値は秒とみなす
+    return round(duration / 60, 2) if duration > 300 else duration
+
+
 def build_workout_rows(workouts: list[dict], gpx_files: list[str] | None = None) -> list[dict]:
     gpx_files = gpx_files or []
     rows = []
@@ -154,13 +170,14 @@ def build_workout_rows(workouts: list[dict], gpx_files: list[str] | None = None)
         # バージョンにより activeEnergy / activeEnergyBurned のどちらかで来る
         energy, energy_units = _qty_units(w.get("activeEnergyBurned") or w.get("activeEnergy"))
         speed, speed_units = _qty_units(w.get("speed"))
+        start_iso, end_iso = parse_datetime(start), parse_datetime(w.get("end"))
         rows.append({
             "id": w["id"],
             "name": w.get("name"),
             "source": w.get("source"),
-            "start_time": parse_datetime(start),
-            "end_time": parse_datetime(w.get("end")),
-            "duration_min": to_number(w.get("duration")),
+            "start_time": start_iso,
+            "end_time": end_iso,
+            "duration_min": _duration_min(w, start_iso, end_iso),
             "distance_qty": distance,
             "distance_units": distance_units,
             "active_energy_qty": energy,

@@ -13,6 +13,7 @@
     <nav class="tabs" role="tablist">
       <button role="tab" data-tab="dashboard" aria-selected="true">ダッシュボード</button>
       <button role="tab" data-tab="events">イベント</button>
+      <button role="tab" data-tab="workouts">ワークアウト</button>
       <button role="tab" data-tab="analysis">分析</button>
       <button role="tab" data-tab="import">取り込み</button>
     </nav>
@@ -38,7 +39,7 @@
       <figure class="card">
         <figcaption id="dash-title">日次推移</figcaption>
         <div class="chart-box"><canvas id="dash-chart"></canvas></div>
-        <p class="note">● はイベントのあった日（ホバーで内容を表示）</p>
+        <p class="note">● はイベント・ワークアウトのあった日（ホバーで内容を表示）</p>
         <details><summary>表で見る</summary><div id="dash-table" class="table-wrap"></div></details>
       </figure>
     </section>
@@ -72,6 +73,31 @@
       </div>
     </section>
 
+    <!-- ワークアウト -->
+    <section id="tab-workouts" class="tab" role="tabpanel" hidden>
+      <div class="filters">
+        <label>期間
+          <select id="wo-range">
+            <option value="30">30日</option>
+            <option value="90" selected>90日</option>
+            <option value="180">180日</option>
+            <option value="365">1年</option>
+            <option value="0">全期間</option>
+          </select>
+        </label>
+        <label>種類 <select id="wo-type" class="workout-type-select" data-all="すべて"></select></label>
+      </div>
+      <div class="stats" id="wo-stats"></div>
+      <figure class="card">
+        <figcaption>週ごとの運動時間（分）</figcaption>
+        <div class="chart-box"><canvas id="wo-chart"></canvas></div>
+      </figure>
+      <div class="card">
+        <h2>ワークアウト一覧</h2>
+        <div id="wo-list" class="table-wrap"></div>
+      </div>
+    </section>
+
     <!-- 分析 -->
     <section id="tab-analysis" class="tab" role="tabpanel" hidden>
       <div class="filters">
@@ -101,10 +127,30 @@
             の値
           </label>
         </div>
-        <p class="note">イベントのない日の平均との差。ラベルの括弧内は件数。</p>
+        <div class="filters inline">
+          <label>対象
+            <select id="cc-kind"><option value="event" selected>手入力のイベント</option><option value="workout">ワークアウト</option></select>
+          </label>
+        </div>
+        <p class="note" id="cc-note">イベントのない日の平均との差。ラベルの括弧内は件数。</p>
         <div class="chart-box"><canvas id="cc-chart"></canvas></div>
         <div id="cc-table" class="table-wrap"></div>
       </figure>
+      <figure class="card">
+        <figcaption>運動時間と指標の関係</figcaption>
+        <div class="filters inline">
+          <label>種類 <select id="dose-type" class="workout-type-select" data-all="すべて"></select></label>
+          <label>運動した日の
+            <select id="dose-lag"><option value="0">当日</option><option value="1" selected>翌日</option><option value="2">翌々日</option></select>
+            の値
+          </label>
+        </div>
+        <p class="note">その日の運動時間の合計で日を分け、「運動なし」の日の平均との差を表示。バーのラベルの括弧内は日数。</p>
+        <p id="dose-summary" class="dose-summary"></p>
+        <div class="chart-box short"><canvas id="dose-chart"></canvas></div>
+        <div id="dose-table" class="table-wrap"></div>
+      </figure>
+
       <p class="note">※ 件数が少ないうちは偶然の差が大きく出ます。効果量 d は |d|≥0.2 小, ≥0.5 中, ≥0.8 大 が目安です。</p>
     </section>
 
