@@ -4,12 +4,15 @@ Render 上で動かすバックエンド API。
   POST /webhook/health-export   Health Auto Export からの自動送信（Bearerトークン認証）
   POST /api/import/zip          手動エクスポートZIPのアップロード取り込み
   GET/POST/PUT/DELETE /api/events  日々のイベント手入力
+  GET/POST/DELETE /api/moods    気分の記録
+  /api/push/..., /api/reminders/...  気分のリマインダー（Web Push）
+  POST /webhook/reminders/tick  外部の定期実行から呼ぶ。リマインドの時刻なら通知を送る
   GET  /api/metrics/...         日次データ
   GET  /api/workouts/...        ワークアウト
   GET  /api/analysis/...        分析結果
   GET  /                        ダッシュボード（static/）
 
-/webhook と /healthz 以外は Basic 認証で保護する（BASIC_AUTH_* が設定されている場合）。
+/webhook と /healthz、Service Worker・マニフェスト以外は Basic 認証で保護する（BASIC_AUTH_* が設定されている場合）。
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import binascii
 import logging
 import secrets
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -29,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from psycopg import sql
 from pydantic import BaseModel, Field, field_validator
 
-from app import analysis, config, db, importer
+from app import analysis, config, db, importer, push, reminders
 
 logger = logging.getLogger("apphealth")
 
@@ -49,7 +52,8 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Health × Events", lifespan=lifespan)
 
 STATIC_DIR = Path(__file__).parent / "static"
-PUBLIC_PATHS = ("/webhook/", "/healthz")
+# ホーム画面に追加したアプリ（iOS の Web Push に必要）は認証なしでこれらを取りに来る
+PUBLIC_PATHS = ("/webhook/", "/healthz", "/sw.js", "/manifest.webmanifest", "/icons/")
 MAX_ZIP_BYTES = 200 * 1024 * 1024
 
 
@@ -183,15 +187,156 @@ def event_categories(conn=Depends(get_db)):
     ).fetchall()
 
 
+# ---------------------------------------------------------------- 気分
+
+# 気分の記録1件1行。date は記録時刻を APP_TIMEZONE の日付にしたもの
+MOODS_SUBQUERY = """
+    select id, logged_at, (logged_at at time zone %(tz)s)::date as date,
+           to_char(logged_at at time zone %(tz)s, 'HH24:MI') as time_local, mood, note
+    from mood_logs
+"""
+
+
+class MoodIn(BaseModel):
+    mood: int = Field(ge=1, le=5)
+    note: str | None = Field(default=None, max_length=2000)
+    logged_at: datetime | None = None   # 省略時は現在時刻
+
+
+@app.get("/api/moods")
+def list_moods(start: date | None = None, end: date | None = None,
+               limit: int = Query(200, ge=1, le=5000), conn=Depends(get_db)):
+    where, params = _named([("date >= %(start)s", "start", start), ("date <= %(end)s", "end", end)])
+    query = sql.SQL("select * from (" + MOODS_SUBQUERY + ") m{} order by logged_at desc, id desc "
+                    "limit %(limit)s").format(where)
+    return conn.execute(query, {"tz": config.APP_TIMEZONE, "limit": limit, **params}).fetchall()
+
+
+@app.post("/api/moods", status_code=201)
+def create_mood(mood: MoodIn, conn=Depends(get_db)):
+    row = conn.execute(
+        "insert into mood_logs (logged_at, mood, note) values (coalesce(%s, now()), %s, %s) returning id",
+        (mood.logged_at, mood.mood, mood.note),
+    ).fetchone()
+    return conn.execute("select * from (" + MOODS_SUBQUERY + ") m where id = %(id)s",
+                        {"tz": config.APP_TIMEZONE, "id": row["id"]}).fetchone()
+
+
+@app.delete("/api/moods/{mood_id}", status_code=204)
+def delete_mood(mood_id: int, conn=Depends(get_db)):
+    conn.execute("delete from mood_logs where id = %s", (mood_id,))
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------- リマインダー（Web Push）
+
+REMINDER_PAYLOAD = {"title": "いまの気分は？", "body": "タップして記録しましょう", "url": "/#mood"}
+
+
+class PushSubscriptionIn(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=2000)
+    keys: dict[str, str]
+
+    @field_validator("keys")
+    @classmethod
+    def require_keys(cls, v: dict[str, str]) -> dict[str, str]:
+        if not v.get("p256dh") or not v.get("auth"):
+            raise ValueError("keys.p256dh と keys.auth は必須です")
+        return v
+
+
+class EndpointIn(BaseModel):
+    endpoint: str
+
+
+class ReminderSettingsIn(BaseModel):
+    enabled: bool
+    interval_minutes: int = Field(ge=30, le=1440)
+    start_time: time
+    end_time: time
+
+
+def _reminder_settings(conn, lock: bool = False) -> dict:
+    return conn.execute("select * from reminder_settings where id = 1" + (" for update" if lock else "")).fetchone()
+
+
+@app.get("/api/push/public-key")
+def push_public_key():
+    if not push.is_configured():
+        raise HTTPException(503, "サーバーに VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY が設定されていません")
+    return {"public_key": config.VAPID_PUBLIC_KEY}
+
+
+@app.post("/api/push/subscribe", status_code=201)
+def push_subscribe(sub: PushSubscriptionIn, request: Request, conn=Depends(get_db)):
+    conn.execute(
+        "insert into push_subscriptions (endpoint, p256dh, auth, user_agent) values (%s, %s, %s, %s) "
+        "on conflict (endpoint) do update set p256dh = excluded.p256dh, auth = excluded.auth, "
+        "user_agent = excluded.user_agent",
+        (sub.endpoint, sub.keys["p256dh"], sub.keys["auth"], request.headers.get("user-agent", "")[:300]),
+    )
+    return {"ok": True}
+
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe(body: EndpointIn, conn=Depends(get_db)):
+    conn.execute("delete from push_subscriptions where endpoint = %s", (body.endpoint,))
+    return {"ok": True}
+
+
+@app.get("/api/reminders/settings")
+def get_reminder_settings(conn=Depends(get_db)):
+    n = conn.execute("select count(*) as n from push_subscriptions").fetchone()["n"]
+    return {**_reminder_settings(conn), "devices": n, "push_configured": push.is_configured(),
+            "timezone": config.APP_TIMEZONE}
+
+
+@app.put("/api/reminders/settings")
+def put_reminder_settings(body: ReminderSettingsIn, conn=Depends(get_db)):
+    conn.execute(
+        "update reminder_settings set enabled = %s, interval_minutes = %s, start_time = %s, end_time = %s "
+        "where id = 1",
+        (body.enabled, body.interval_minutes, body.start_time, body.end_time),
+    )
+    return get_reminder_settings(conn)
+
+
+@app.post("/api/reminders/test")
+def reminder_test(conn=Depends(get_db)):
+    push_public_key()  # 未設定なら 503
+    return push.send_to_all(conn, {**REMINDER_PAYLOAD, "title": "テスト通知", "body": "通知は正しく届いています"})
+
+
+@app.post("/webhook/reminders/tick", dependencies=[Depends(require_webhook_token)])
+def reminder_tick(conn=Depends(get_db)):
+    """外部の定期実行（数分〜15分おき）から呼ぶ。リマインドの時刻になっていれば全端末に通知する。"""
+    now = datetime.now(timezone.utc)
+    # 定期実行が重なっても二重に送らないよう、判定から送信済みの記録までを行ロックで囲む
+    with conn.transaction():
+        settings = _reminder_settings(conn, lock=True)
+        last_mood = conn.execute("select max(logged_at) as t from mood_logs").fetchone()["t"]
+        due = push.is_configured() and reminders.is_due(now, settings, last_mood, config.APP_TIMEZONE)
+        conn.execute("update reminder_settings set last_checked_at = %s"
+                     + (", last_sent_at = %s" if due else "") + " where id = 1",
+                     (now, now) if due else (now,))
+    if not due:
+        return {"due": False}
+    counts = push.send_to_all(conn, REMINDER_PAYLOAD)
+    logger.info("reminder sent: %s", counts)
+    return {"due": True, **counts}
+
+
 # ---------------------------------------------------------------- メトリクス
 
 @app.get("/api/metrics/catalog")
 def metric_catalog(conn=Depends(get_db)):
     rows = conn.execute("select * from metric_catalog order by metric_name").fetchall()
-    sleep = [{"metric_name": name, "units": units, "n_rows": None,
+    extra = [{"metric_name": name, "units": units, "n_rows": None,
               "first_date": None, "last_date": None}
              for name, (_, units) in analysis.SLEEP_METRICS.items()]
-    return sleep + rows
+    extra.append({"metric_name": analysis.MOOD_METRIC, "units": "1〜5", "n_rows": None,
+                  "first_date": None, "last_date": None})
+    return extra + rows
 
 
 def load_series(conn, metric: str, start: date | None = None,
@@ -199,7 +344,13 @@ def load_series(conn, metric: str, start: date | None = None,
     """
     指標を1日1値の {date: 値} にする。
     統計型（心拍など）は avg_value、シンプル型は qty を使い、同じ日に複数 source があれば平均する。
+    気分は APP_TIMEZONE の日付ごとの平均。
     """
+    if metric == analysis.MOOD_METRIC:
+        where, params = _named([("date >= %(start)s", "start", start), ("date <= %(end)s", "end", end)])
+        query = sql.SQL("select date, avg(mood) as value from (" + MOODS_SUBQUERY + ") m{where} "
+                        "group by date order by date").format(where=where)
+        return {r["date"]: r["value"] for r in conn.execute(query, {"tz": config.APP_TIMEZONE, **params})}
     if metric in analysis.SLEEP_METRICS:
         column, _ = analysis.SLEEP_METRICS[metric]
         where, params = _where([("date >= %s", start), ("date <= %s", end)])

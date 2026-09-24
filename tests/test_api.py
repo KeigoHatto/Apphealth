@@ -13,13 +13,14 @@ import zipfile
 import pytest
 from fastapi.testclient import TestClient
 
-from app import config, db, main
+from app import config, db, main, push
 from tests.sample_payload import SAMPLE
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL が未設定")
 
-TABLES = "health_metrics, sleep_sessions, workouts, heart_rate_notifications, events"
+TABLES = ("health_metrics, sleep_sessions, workouts, heart_rate_notifications, events, "
+          "mood_logs, push_subscriptions, reminder_settings")
 
 
 def rows(conn, table):
@@ -31,6 +32,7 @@ def fake(monkeypatch):
     with db.connect(TEST_DATABASE_URL) as conn:
         db.init_schema(conn)
         conn.execute(f"truncate {TABLES} restart identity")
+        conn.execute("insert into reminder_settings (id) values (1)")
         main.app.dependency_overrides[main.get_db] = lambda: conn
         monkeypatch.setattr(config, "DATABASE_URL", "")  # lifespan でプールを作らせない
         monkeypatch.setattr(config, "WEBHOOK_TOKEN", "secret-token")
@@ -149,8 +151,10 @@ def test_basic_auth(fake, http, monkeypatch):
     good = "Basic " + base64.b64encode(b"me:pw").decode()
     assert http.get("/api/events", headers={"Authorization": good}).status_code == 200
     assert http.get("/", headers={"Authorization": good}).status_code == 200
-    # Webhook と healthz は Basic 認証の対象外
+    # Webhook と healthz、ホーム画面アプリが認証なしで取りに来るファイルは Basic 認証の対象外
     assert http.get("/healthz").status_code == 200
+    assert http.get("/sw.js").status_code == 200
+    assert http.get("/manifest.webmanifest").status_code == 200
     r = http.post("/webhook/health-export", json=SAMPLE, headers={"Authorization": "Bearer secret-token"})
     assert r.status_code == 200
 
@@ -218,3 +222,96 @@ def test_workouts_endpoints_and_analysis(fake, http):
     r = http.get("/api/analysis/workout-dose",
                  params={"metric": "heart_rate_variability", "name": "Yoga"}).json()
     assert r["points"][0]["date"] == "2026-08-18"
+
+
+def test_moods_and_mood_metric(fake, http):
+    # 00:30 JST は UTC では前日だが、JST の日付（8/25）として集計されること
+    for mood, at in [(2, "2026-08-24T08:00:00+09:00"), (4, "2026-08-24T20:00:00+09:00"),
+                     (5, "2026-08-25T00:30:00+09:00")]:
+        r = http.post("/api/moods", json={"mood": mood, "logged_at": at, "note": "眠い" if mood == 2 else None})
+        assert r.status_code == 201, r.text
+    assert r.json()["date"] == "2026-08-25" and r.json()["time_local"] == "00:30"
+    assert http.post("/api/moods", json={"mood": 6}).status_code == 422
+    assert http.post("/api/moods", json={"mood": 3}).json()["logged_at"]  # 省略時は現在時刻
+
+    moods = http.get("/api/moods", params={"end": "2026-08-24"}).json()
+    assert [(m["mood"], m["note"]) for m in moods] == [(4, None), (2, "眠い")]
+
+    assert "mood" in {m["metric_name"] for m in http.get("/api/metrics/catalog").json()}
+    series = http.get("/api/metrics/daily",
+                      params={"metric": "mood", "start": "2026-08-24", "end": "2026-08-25"}).json()["series"]
+    assert series == [{"date": "2026-08-24", "value": 3}, {"date": "2026-08-25", "value": 5}]
+
+    assert http.delete(f"/api/moods/{moods[0]['id']}").status_code == 204
+    assert len(http.get("/api/moods").json()) == 3
+
+
+SUB = {"endpoint": "https://push.example/abc", "keys": {"p256dh": "key", "auth": "auth"}}
+
+
+@pytest.fixture
+def vapid(monkeypatch):
+    monkeypatch.setattr(config, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(config, "VAPID_PRIVATE_KEY", "priv")
+    sent = []
+    monkeypatch.setattr(push, "webpush", lambda info, data, **kw: sent.append((info, json.loads(data))))
+    return sent
+
+
+def test_push_subscription_and_settings(fake, http, vapid):
+    assert http.get("/api/push/public-key").json() == {"public_key": "pub"}
+    assert http.post("/api/push/subscribe", json={"endpoint": "x", "keys": {}}).status_code == 422
+    for _ in range(2):  # 同じ端末の登録し直しは上書き
+        assert http.post("/api/push/subscribe", json=SUB).status_code == 201
+    s = http.get("/api/reminders/settings").json()
+    assert (s["enabled"], s["devices"], s["push_configured"]) == (False, 1, True)
+
+    r = http.put("/api/reminders/settings", json={"enabled": True, "interval_minutes": 90,
+                                                  "start_time": "08:30", "end_time": "22:00"})
+    assert r.status_code == 200, r.text
+    assert (r.json()["interval_minutes"], r.json()["start_time"]) == (90, "08:30:00")
+    assert http.put("/api/reminders/settings", json={"enabled": True, "interval_minutes": 5,
+                                                     "start_time": "08:30", "end_time": "22:00"}).status_code == 422
+
+    assert http.post("/api/reminders/test").json()["sent"] == 1
+    assert vapid[0][0]["keys"] == SUB["keys"] and vapid[0][1]["title"] == "テスト通知"
+
+    http.post("/api/push/unsubscribe", json={"endpoint": SUB["endpoint"]})
+    assert http.get("/api/reminders/settings").json()["devices"] == 0
+
+
+def test_push_not_configured(fake, http, monkeypatch):
+    monkeypatch.setattr(config, "VAPID_PUBLIC_KEY", "")
+    assert http.get("/api/push/public-key").status_code == 503
+    assert http.post("/api/reminders/test").status_code == 503
+
+
+def test_reminder_tick(fake, http, vapid):
+    auth = {"Authorization": "Bearer secret-token"}
+    assert http.post("/webhook/reminders/tick").status_code == 401
+    http.post("/api/push/subscribe", json=SUB)
+    # 無効のあいだは送らないが、定期チェックが届いたことは記録する
+    assert http.post("/webhook/reminders/tick", headers=auth).json() == {"due": False}
+    assert http.get("/api/reminders/settings").json()["last_checked_at"]
+
+    http.put("/api/reminders/settings", json={"enabled": True, "interval_minutes": 60,
+                                              "start_time": "00:00", "end_time": "00:00"})
+    r = http.post("/webhook/reminders/tick", headers=auth).json()
+    assert r == {"due": True, "sent": 1, "failed": 0, "removed": 0}
+    assert vapid[-1][1]["url"] == "/#mood"
+    # 送った直後は次の間隔まで送らない
+    assert http.post("/webhook/reminders/tick", headers=auth).json() == {"due": False}
+    assert len(vapid) == 1
+
+
+def test_expired_subscription_is_removed(fake, http, vapid, monkeypatch):
+    class Gone:
+        status_code = 410
+
+    def fail(info, data, **kw):
+        raise push.WebPushException("gone", response=Gone())
+
+    monkeypatch.setattr(push, "webpush", fail)
+    http.post("/api/push/subscribe", json=SUB)
+    assert http.post("/api/reminders/test").json() == {"sent": 0, "failed": 0, "removed": 1}
+    assert rows(fake, "push_subscriptions") == []

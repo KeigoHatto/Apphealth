@@ -7,6 +7,9 @@
   <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Health × Events">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
   <title>Health × Events</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -22,7 +25,7 @@
       </button>
       <button role="tab" data-tab="events">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/><path d="m9 15 2 2 4-4"/></svg>
-        <span>イベント</span>
+        <span>記録</span>
       </button>
       <button role="tab" data-tab="workouts">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.5" r="7"/><path d="M12 10v3.5l2.5 1.5M10 3h4M12 3v3.5"/></svg>
@@ -65,9 +68,78 @@
       </figure>
     </section>
 
-    <!-- イベント -->
+    <!-- 記録（気分・イベント） -->
     <section id="tab-events" class="tab" role="tabpanel" hidden>
-      <h1 class="page-title">イベント</h1>
+      <h1 class="page-title">記録</h1>
+
+      <!-- 気分: 顔をタップした時点で記録する（リマインダーの通知から開いてすぐ終わるように） -->
+      <div class="card" id="mood">
+        <div class="card-head">
+          <h2>いまの気分</h2>
+          <span class="card-head-note" id="mood-last"></span>
+        </div>
+        <div class="mood-scale" role="group" aria-label="気分を選ぶとすぐ記録されます">
+          <button type="button" class="mood-btn" data-mood="1"><span class="face" aria-hidden="true">😣</span><span>とても悪い</span></button>
+          <button type="button" class="mood-btn" data-mood="2"><span class="face" aria-hidden="true">🙁</span><span>悪い</span></button>
+          <button type="button" class="mood-btn" data-mood="3"><span class="face" aria-hidden="true">😐</span><span>ふつう</span></button>
+          <button type="button" class="mood-btn" data-mood="4"><span class="face" aria-hidden="true">🙂</span><span>良い</span></button>
+          <button type="button" class="mood-btn" data-mood="5"><span class="face" aria-hidden="true">😄</span><span>とても良い</span></button>
+        </div>
+        <input type="text" id="mood-note" class="mood-note" maxlength="2000" placeholder="メモ（任意・先に書いてから顔をタップ）" aria-label="気分のメモ">
+        <div id="mood-list"></div>
+      </div>
+
+      <!-- 気分のリマインダー -->
+      <details class="card reminder" id="reminder">
+        <summary>
+          <span class="reminder-title">気分のリマインダー</span>
+          <span class="reminder-summary" id="reminder-summary"></span>
+        </summary>
+        <div class="form reminder-body">
+          <div class="field">
+            <span class="field-label">この端末の通知</span>
+            <div class="row">
+              <span id="push-status" class="push-status"></span>
+              <button type="button" class="secondary small" id="push-toggle" hidden></button>
+            </div>
+            <p class="note" id="push-help" hidden></p>
+          </div>
+          <form id="reminder-form" class="form" novalidate>
+            <label class="switch-row">
+              <span>定期的にリマインドする</span>
+              <input type="checkbox" name="enabled" class="switch" role="switch">
+            </label>
+            <div class="field">
+              <label class="field-label" for="reminder-interval">間隔</label>
+              <select id="reminder-interval" name="interval_minutes">
+                <option value="60">1時間ごと</option>
+                <option value="90">1時間半ごと</option>
+                <option value="120">2時間ごと</option>
+                <option value="180">3時間ごと</option>
+                <option value="240">4時間ごと</option>
+                <option value="360">6時間ごと</option>
+                <option value="720">12時間ごと</option>
+                <option value="1440">1日1回</option>
+              </select>
+              <p class="note">最後に通知した時刻か、最後に気分を記録した時刻のうち新しいほうから数えます。</p>
+            </div>
+            <div class="field">
+              <span class="field-label" id="reminder-window-label">通知する時間帯</span>
+              <div class="row" aria-labelledby="reminder-window-label">
+                <input type="time" name="start_time" required aria-label="開始">
+                <span aria-hidden="true">〜</span>
+                <input type="time" name="end_time" required aria-label="終了">
+              </div>
+            </div>
+            <div class="actions">
+              <button type="submit" class="primary">保存</button>
+              <button type="button" id="reminder-test">テスト通知</button>
+            </div>
+            <p class="note" id="reminder-status"></p>
+          </form>
+        </div>
+      </details>
+
       <form id="event-form" class="card form" novalidate>
         <h2 id="event-form-title">イベントを記録</h2>
         <input type="hidden" name="id">

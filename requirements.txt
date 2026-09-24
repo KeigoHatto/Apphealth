@@ -4,3 +4,4 @@ psycopg[binary]==3.3.6
 psycopg-pool==3.3.3
 python-dotenv==1.2.3
 python-multipart==0.0.32
+pywebpush==2.5.0

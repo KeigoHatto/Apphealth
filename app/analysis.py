@@ -21,6 +21,9 @@ SLEEP_METRICS = {
     "sleep_awake": ("awake_hr", "hr"),
 }
 
+# 気分（mood_logs）の1日の平均は、この擬似メトリクス名で参照する
+MOOD_METRIC = "mood"
+
 
 def _to_date(value) -> date:
     return value if isinstance(value, date) else date.fromisoformat(str(value)[:10])

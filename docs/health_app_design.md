@@ -38,6 +38,8 @@ Apple Watchの健康データ（心拍・睡眠・活動量など）と、日々
 | `workouts` | ワークアウト単位のサマリー。GPXファイル名も紐付け |
 | `heart_rate_notifications` | 心拍アラート履歴 |
 | `events` | **ユーザーが手入力する日々のイベント**。`date`, `category`（例: alcohol/stress/travel等、自由運用）, `note`, `intensity`（1〜5の自己申告強度） |
+| `mood_logs` | 気分の記録（1日に何度でも）。`logged_at`, `mood`（1〜5）, `note`。日次平均を `mood` 指標として分析に使う |
+| `push_subscriptions` / `reminder_settings` | 気分のリマインダー（Web Push）の登録端末と設定 |
 
 重複防止のため `health_metrics` は `(date, metric_name, source)`、`sleep_sessions` は `(date, source)` でunique制約。
 

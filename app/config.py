@@ -12,3 +12,9 @@ BASIC_AUTH_PASSWORD = os.environ.get("BASIC_AUTH_PASSWORD", "")
 
 # ワークアウトの開始時刻を「何日のワークアウトか」に変換するときのタイムゾーン
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Asia/Tokyo")
+
+# Web Push（気分のリマインダー）。python -m scripts.generate_vapid_keys で作る
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+# プッシュサービスが問題のあるときに連絡する先（mailto: か https:）
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:admin@example.com")

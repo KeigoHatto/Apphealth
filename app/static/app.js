@@ -10,7 +10,7 @@ const METRIC_LABELS = {
   step_count: "歩数", active_energy: "アクティブエネルギー", basal_energy_burned: "安静時消費エネルギー",
   walking_running_distance: "歩行+走行距離", apple_exercise_time: "エクササイズ時間",
   apple_stand_time: "スタンド時間", flights_climbed: "上った階数", time_in_daylight: "日光を浴びた時間",
-  cardio_recovery: "心拍数回復",
+  cardio_recovery: "心拍数回復", mood: "気分",
 };
 const DEFAULT_METRICS = ["heart_rate_variability", "resting_heart_rate", "sleep_total"];
 
@@ -198,7 +198,7 @@ function showTab(name) {
   }
   try { localStorage.setItem("tab", name); } catch (_) { /* ignore */ }
   if (name === "dashboard") loadDashboard();
-  if (name === "events") loadEvents();
+  if (name === "events") { loadEvents(); loadMoods(); loadReminder(); }
   if (name === "workouts") loadWorkouts();
   if (name === "analysis") loadAnalysis();
 }
@@ -535,6 +535,284 @@ form.addEventListener("submit", async (ev) => {
   }
 });
 
+// ---------------------------------------------------------------- 気分
+
+const MOODS = { 1: ["😣", "とても悪い"], 2: ["🙁", "悪い"], 3: ["😐", "ふつう"], 4: ["🙂", "良い"], 5: ["😄", "とても良い"] };
+const MOOD_PAGE = 5;
+const moodView = { rows: [], limit: MOOD_PAGE };
+
+function agoText(iso) {
+  const min = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (min < 1) return "たった今";
+  if (min < 60) return `${min}分前`;
+  if (min < 24 * 60) return `${Math.floor(min / 60)}時間前`;
+  return `${Math.floor(min / 1440)}日前`;
+}
+
+function renderMoods() {
+  const { rows, limit } = moodView;
+  $("#mood-last").textContent = rows.length ? `最後の記録: ${agoText(rows[0].logged_at)}` : "";
+  if (!rows.length) {
+    $("#mood-list").innerHTML = '<p class="empty">まだ記録がありません。</p>';
+    return;
+  }
+  const trash = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>';
+  const today = isoDate(new Date());
+  $("#mood-list").innerHTML = `<ul class="list mood-list">${rows.slice(0, limit).map((m) => {
+    const [face, text] = MOODS[m.mood];
+    const when = m.date === today ? m.time_local : `${dateParts(m.date).md} ${m.time_local}`;
+    return `
+    <li class="list-row">
+      <div class="list-date"><span class="mood-face" aria-hidden="true">${face}</span></div>
+      <div class="list-main">
+        <div class="list-title">${esc(text)}</div>
+        <div class="list-sub">${esc(when)}${m.note ? ` · ${esc(m.note)}` : ""}</div>
+      </div>
+      <div class="list-trailing">
+        <button type="button" class="icon-button danger" data-delete-mood="${m.id}" aria-label="削除">${trash}</button>
+      </div>
+    </li>`;
+  }).join("")}</ul>` +
+    (rows.length > limit ? `<button type="button" class="more" data-more>さらに表示</button>` : "");
+}
+
+async function loadMoods() {
+  try {
+    moodView.rows = await api("/api/moods?limit=100");
+  } catch (e) {
+    $("#mood-list").innerHTML = `<p class="msg error">${esc(e.message)}</p>`;
+    return;
+  }
+  renderMoods();
+}
+
+async function saveMood(body) {
+  return api("/api/moods", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+document.querySelectorAll("[data-mood]").forEach((b) => b.addEventListener("click", async () => {
+  const mood = Number(b.dataset.mood);
+  const note = $("#mood-note").value.trim() || null;
+  document.querySelectorAll("[data-mood]").forEach((x) => { x.disabled = true; });
+  try {
+    await saveMood({ mood, note });
+    $("#mood-note").value = "";
+    b.classList.add("saved");
+    setTimeout(() => b.classList.remove("saved"), 600);
+    toast(`${MOODS[mood][0]} 「${MOODS[mood][1]}」を記録しました`);
+    await loadMoods();
+  } catch (e) {
+    toast(`記録できませんでした: ${e.message}`, { error: true });
+  } finally {
+    document.querySelectorAll("[data-mood]").forEach((x) => { x.disabled = false; });
+  }
+}));
+
+$("#mood-list").addEventListener("click", async (ev) => {
+  if (ev.target.closest("[data-more]")) {
+    moodView.limit += MOOD_PAGE * 4;
+    renderMoods();
+    return;
+  }
+  const del = ev.target.closest("[data-delete-mood]");
+  if (!del) return;
+  const m = moodView.rows.find((r) => String(r.id) === del.dataset.deleteMood);
+  if (!m) return;
+  moodView.rows = moodView.rows.filter((r) => r !== m);
+  renderMoods();
+  try {
+    await api(`/api/moods/${m.id}`, { method: "DELETE" });
+  } catch (err) {
+    toast(`削除できませんでした: ${err.message}`, { error: true });
+    await loadMoods();
+    return;
+  }
+  toast(`${MOODS[m.mood][0]} の記録を削除しました`, {
+    action: "元に戻す",
+    onAction: async () => {
+      try {
+        await saveMood({ mood: m.mood, note: m.note, logged_at: m.logged_at });
+        toast("元に戻しました");
+      } catch (err) {
+        toast(`元に戻せませんでした: ${err.message}`, { error: true });
+      }
+      await loadMoods();
+    },
+  });
+});
+
+// ---------------------------------------------------------------- 気分のリマインダー（Web Push）
+
+const reminderForm = $("#reminder-form");
+const pushSupported = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isStandalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+
+function b64urlToBytes(s) {
+  const b64 = (s + "=".repeat((4 - (s.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+function sameKey(buf, bytes) {
+  if (!buf) return false;
+  const a = new Uint8Array(buf);
+  return a.length === bytes.length && a.every((v, i) => v === bytes[i]);
+}
+
+async function currentSubscription() {
+  if (!pushSupported) return null;
+  const reg = await navigator.serviceWorker.getRegistration();
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+
+async function renderPushStatus() {
+  const status = $("#push-status");
+  const btn = $("#push-toggle");
+  const help = $("#push-help");
+  help.hidden = true;
+  if (!pushSupported) {
+    status.textContent = "このブラウザでは使えません";
+    btn.hidden = true;
+    if (isIOS && !isStandalone) {
+      help.textContent = "iPhone では、Safari の共有ボタン →「ホーム画面に追加」で追加したアプリから開くと通知を受け取れます（iOS 16.4 以降）。";
+      help.hidden = false;
+    }
+    return;
+  }
+  const sub = await currentSubscription();
+  const denied = Notification.permission === "denied";
+  status.textContent = sub ? "オン" : denied ? "ブロックされています" : "オフ";
+  status.classList.toggle("on", Boolean(sub));
+  btn.hidden = denied && !sub;
+  btn.textContent = sub ? "この端末で受け取らない" : "通知をオンにする";
+  if (denied && !sub) {
+    help.textContent = "ブラウザ（iPhone は設定アプリ → 通知）でこのサイトの通知を許可してください。";
+    help.hidden = false;
+  }
+}
+
+async function enablePush() {
+  // iOS はタップの直後でないと許可ダイアログを出せないので、通信より先に許可を求める
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") throw new Error("通知が許可されませんでした");
+  const { public_key: publicKey } = await api("/api/push/public-key");
+  const key = b64urlToBytes(publicKey);
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  // サーバーの鍵が作り直されていたら登録し直す
+  if (sub && !sameKey(sub.options.applicationServerKey, key)) {
+    await sub.unsubscribe();
+    sub = null;
+  }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  await api("/api/push/subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub) });
+}
+
+async function disablePush() {
+  const sub = await currentSubscription();
+  if (!sub) return;
+  await api("/api/push/unsubscribe", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoint: sub.endpoint }) });
+  await sub.unsubscribe();
+}
+
+$("#push-toggle").addEventListener("click", async (ev) => {
+  const btn = ev.currentTarget;
+  btn.disabled = true;
+  try {
+    const on = Boolean(await currentSubscription());
+    await (on ? disablePush() : enablePush());
+    toast(on ? "この端末では通知を受け取りません" : "この端末で通知を受け取ります");
+  } catch (e) {
+    toast(e.message, { error: true });
+  } finally {
+    btn.disabled = false;
+    await Promise.all([renderPushStatus(), loadReminder()]);
+  }
+});
+
+function intervalText(min) {
+  return min % 60 ? `${Math.floor(min / 60) ? `${Math.floor(min / 60)}時間` : ""}${min % 60}分ごと` : min === 1440 ? "1日1回" : `${min / 60}時間ごと`;
+}
+
+async function loadReminder() {
+  renderPushStatus();
+  let s;
+  try {
+    s = await api("/api/reminders/settings");
+  } catch (e) {
+    $("#reminder-status").textContent = e.message;
+    return;
+  }
+  const hm = (t) => t.slice(0, 5);
+  reminderForm.enabled.checked = s.enabled;
+  reminderForm.interval_minutes.value = String(s.interval_minutes);
+  reminderForm.start_time.value = hm(s.start_time);
+  reminderForm.end_time.value = hm(s.end_time);
+  $("#reminder-summary").textContent = s.enabled
+    ? `${intervalText(s.interval_minutes)}・${hm(s.start_time)}〜${hm(s.end_time)}` : "オフ";
+
+  const lines = [`通知を受け取る端末: ${s.devices}台`];
+  if (!s.push_configured) lines.push("⚠️ サーバーに VAPID 鍵が設定されていません（README 参照）");
+  if (s.last_sent_at) lines.push(`最後のリマインド: ${agoText(s.last_sent_at)}`);
+  if (!s.last_checked_at) {
+    lines.push("⚠️ 定期チェックがまだ一度も届いていません。README の「気分のリマインダー」の手順で設定してください");
+  } else if (Date.now() - new Date(s.last_checked_at).getTime() > 60 * 60000) {
+    lines.push(`⚠️ 定期チェックが止まっているようです（最後: ${agoText(s.last_checked_at)}）`);
+  }
+  $("#reminder-status").textContent = lines.join(" / ");
+}
+
+reminderForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = reminderForm;
+  if (!f.start_time.value || !f.end_time.value) {
+    toast("時間帯を入力してください", { error: true });
+    return;
+  }
+  try {
+    await api("/api/reminders/settings", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: f.enabled.checked, interval_minutes: Number(f.interval_minutes.value),
+        start_time: f.start_time.value, end_time: f.end_time.value }),
+    });
+    toast("リマインダーの設定を保存しました");
+    // オンにしたのにこの端末で通知を受け取っていなければ、そのまま受け取れるようにする
+    if (f.enabled.checked && pushSupported && !(await currentSubscription()) && Notification.permission !== "denied") {
+      await enablePush();
+    }
+  } catch (e) {
+    toast(`保存できませんでした: ${e.message}`, { error: true });
+  }
+  await loadReminder();
+});
+
+$("#reminder-test").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/reminders/test", { method: "POST" });
+    toast(r.sent ? `${r.sent}台に送りました` : "送れる端末がありません。先に「通知をオンにする」を押してください",
+      { error: !r.sent });
+  } catch (e) {
+    toast(`送れませんでした: ${e.message}`, { error: true });
+  }
+});
+
+// 通知から開いたとき（#mood）は気分の入力へ
+function openFromHash() {
+  if (location.hash !== "#mood") return false;
+  showTab("events");
+  history.replaceState(null, "", location.pathname + location.search);
+  requestAnimationFrame(() => $("#mood").scrollIntoView({ block: "start" }));
+  return true;
+}
+window.addEventListener("hashchange", openFromHash);
+if (pushSupported) {
+  navigator.serviceWorker.register("/sw.js").catch((e) => console.error(e));
+  navigator.serviceWorker.addEventListener("message", (ev) => {
+    if (ev.data?.type !== "open") return;
+    location.hash = new URL(ev.data.url).hash;
+  });
+}
+
 // ---------------------------------------------------------------- ワークアウト
 
 // 月曜始まりの週の初日（YYYY-MM-DD）
@@ -836,6 +1114,7 @@ $("#import-form").addEventListener("submit", async (ev) => {
 (async function init() {
   resetEventForm();
   await Promise.all([loadCatalog(), loadCategories()]);
+  if (openFromHash()) return;
   let tab = "dashboard";
   try { tab = localStorage.getItem("tab") || tab; } catch (_) { /* ignore */ }
   showTab(tab);

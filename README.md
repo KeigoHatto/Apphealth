@@ -17,9 +17,12 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 | `app/importer.py` | 変換した行を DB に upsert（1回の取り込みは1トランザクション）。Webhook / ZIP / CLI で共通 |
 | `app/db.py` | Postgres 接続プール・スキーマ適用・upsert |
 | `app/analysis.py` | イベント前後比較・ラグ分析・カテゴリ別比較 |
+| `app/reminders.py` | 気分のリマインダーを送るかどうかの判定（純粋関数） |
+| `app/push.py` | Web Push の送信 |
 | `app/static/` | フロントエンド（素の HTML/JS + Chart.js） |
 | `db/schema.sql` | テーブル定義（アプリ起動時に自動適用。何度実行しても安全） |
 | `scripts/import_health_data.py` | ZIP を CLI から取り込むスクリプト |
+| `scripts/generate_vapid_keys.py` | Web Push 用の VAPID 鍵を作るスクリプト |
 | `render.yaml` | Render Blueprint |
 
 ## API
@@ -31,6 +34,13 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 | GET/POST | `/api/events` | イベント一覧 / 作成（`date`, `category`, `note`, `intensity`） |
 | PUT/DELETE | `/api/events/{id}` | イベント更新 / 削除 |
 | GET | `/api/events/categories` | カテゴリと件数 |
+| GET/POST | `/api/moods` | 気分の記録一覧 / 作成（`mood` 1〜5, `note`, `logged_at` 省略時は現在時刻） |
+| DELETE | `/api/moods/{id}` | 気分の記録を削除 |
+| GET/PUT | `/api/reminders/settings` | リマインダー設定（`enabled`, `interval_minutes`, `start_time`, `end_time`） |
+| POST | `/api/reminders/test` | 登録済みの全端末にテスト通知 |
+| GET | `/api/push/public-key` | Web Push の公開鍵 |
+| POST | `/api/push/subscribe` / `/api/push/unsubscribe` | 端末の通知の登録 / 解除 |
+| POST | `/webhook/reminders/tick` | 外部の定期実行から呼ぶ。リマインドの時刻なら通知（`Authorization: Bearer <WEBHOOK_TOKEN>`） |
 | GET | `/api/metrics/catalog` | 取り込み済み指標の一覧 |
 | GET | `/api/metrics/daily?metric=&start=&end=` | 1日1値の系列（`sleep_total` 等の睡眠指標も可） |
 | GET | `/api/workouts?start=&end=&name=` | ワークアウト一覧（`date` と `start_local` は `APP_TIMEZONE` 基準） |
@@ -41,7 +51,7 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
 | GET | `/api/analysis/category-comparison?metric=&lag=1&kind=event` | カテゴリ別の比較（`kind=workout` でワークアウトの種類別） |
 | GET | `/api/analysis/workout-dose?metric=&lag=1&name=` | その日の運動時間と N 日後の指標の関係（区分別の平均・相関係数） |
 
-`/webhook/*` と `/healthz` 以外は `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` の Basic 認証で保護されます。
+`/webhook/*`・`/healthz`・`/sw.js`・`/manifest.webmanifest`・`/icons/` 以外は `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` の Basic 認証で保護されます。
 
 ### 分析の定義
 - **前後の変化**: 各イベントについて直前 `window` 日の平均をベースラインとし、-window〜+window 日の値との差を平均。
@@ -51,6 +61,7 @@ Apple Watch の健康データ（Health Auto Export 経由）と、日々の出�
   強度の絞り込みは手入力イベントにだけ適用。ワークアウト時間は開始〜終了時刻から計算する。
 - **運動時間と指標**: その日の運動時間の合計（なし / 1〜30分 / 31〜60分 / 61分以上）で日を分け、N 日後の指標の平均を比較。相関係数も表示。
   ワークアウト記録の最初の日より前は対象外。
+- **気分**: `mood` という指標として、記録の1日（`APP_TIMEZONE` 基準）の平均を他の指標と同じように表示・分析できる。
 - 1日1値への集約: 心拍などの統計型は `Avg`、それ以外は `qty`。同じ日に複数 source があれば平均。
 
 ## セットアップ
@@ -89,3 +100,19 @@ Automations → REST API を作成:
 - Export Format: JSON / Aggregate Data: ON / Period: Day（直近数日分を送る設定にしても upsert なので重複しません）
 
 Render 無料プランはスリープから起動に 30〜60 秒かかるため、初回の同期がタイムアウトした場合は次回同期で取り込まれます。
+
+### 5. 気分のリマインダー（Web Push）
+「記録」タブの「いまの気分」で顔をタップすると記録されます。「気分のリマインダー」で決めた間隔ごとに通知が届きます。
+
+1. VAPID 鍵を作る: `python -m scripts.generate_vapid_keys`。出力された `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` と、
+   連絡先の `VAPID_SUBJECT`（例: `mailto:you@example.com`）を Render の環境変数に設定
+2. 定期チェックを設定する。Render の無料プランはスリープしてしまうので、外部から数分〜15分おきに叩いてもらう。
+   例: [cron-job.org](https://cron-job.org)（無料）で 10 分おきに
+   - URL: `https://<render-app>.onrender.com/webhook/reminders/tick`
+   - Method: POST / Header: `Authorization: Bearer <WEBHOOK_TOKEN>`
+3. iPhone の場合は Safari で開き、共有ボタン →「ホーム画面に追加」。**ホーム画面のアイコンから開いた**アプリで
+   「記録」→「気分のリマインダー」→「通知をオンにする」（iOS 16.4 以降。Safari のタブのままでは通知を受け取れません）
+4. 「定期的にリマインドする」をオンにし、間隔と時間帯を選んで保存。「テスト通知」で届くか確認
+
+リマインドは、最後に通知した時刻と最後に気分を記録した時刻のうち新しいほうから間隔が経ったら、時間帯の中でだけ送ります
+（自分で記録した直後には来ません）。定期チェックが届いているかは設定画面の下に表示されます。

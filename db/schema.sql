@@ -93,7 +93,38 @@ create table if not exists events (
 create index if not exists idx_events_date on events (date);
 create index if not exists idx_events_category on events (category);
 
--- 6) 取り込まれている指標の一覧（ダッシュボードのセレクタ用）
+-- 6) 気分の記録（1日に何度でも。1=とても悪い〜5=とても良い）
+create table if not exists mood_logs (
+  id            bigserial primary key,
+  logged_at     timestamptz not null default now(),
+  mood          smallint not null check (mood between 1 and 5),
+  note          text,
+  created_at    timestamptz not null default now()
+);
+create index if not exists idx_mood_logs_logged_at on mood_logs (logged_at);
+
+-- 7) Web Push の購読（通知を受け取る端末ごとに1行）
+create table if not exists push_subscriptions (
+  endpoint      text primary key,
+  p256dh        text not null,
+  auth          text not null,
+  user_agent    text,
+  created_at    timestamptz not null default now()
+);
+
+-- 8) 気分のリマインダー設定（1行だけ）
+create table if not exists reminder_settings (
+  id                smallint primary key default 1 check (id = 1),
+  enabled           boolean not null default false,
+  interval_minutes  integer not null default 180 check (interval_minutes between 30 and 1440),
+  start_time        time not null default '09:00',   -- APP_TIMEZONE の時刻
+  end_time          time not null default '21:00',
+  last_sent_at      timestamptz,
+  last_checked_at   timestamptz                      -- 定期チェックが最後に届いた時刻（設定確認用）
+);
+insert into reminder_settings (id) values (1) on conflict do nothing;
+
+-- 9) 取り込まれている指標の一覧（ダッシュボードのセレクタ用）
 create or replace view metric_catalog as
 select metric_name,
        max(units)  as units,
